@@ -1,0 +1,22 @@
+{
+  "name": "darvinyi-debate",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Multi-agent debate platform — public arena for frontier LLMs to argue under Lincoln-Douglas rules.",
+  "type": "module",
+  "scripts": {
+    "postinstall": "cd server && npm install && cd ../client && npm install",
+    "build": "cd client && npm run build",
+    "start": "cd server && npx prisma migrate deploy && node src/seed.js && node src/index.js",
+    "dev:server": "cd server && npm run dev",
+    "dev:client": "cd client && npm run dev"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yidarvin/darvinyi-debate"
+  },
+  "license": "UNLICENSED"
+}

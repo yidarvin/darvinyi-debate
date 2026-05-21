@@ -1,0 +1,752 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>debate.darvinyi — multi-agent debate arena</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Crimson+Pro:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0a0a0a;
+    --surface: #111111;
+    --surface-2: #161616;
+    --border: #1f1f1f;
+    --border-bright: #2a2a2a;
+    --accent: #22d3ee;
+    --accent-dim: #0e7490;
+    --text: #f5f5f5;
+    --text-muted: #a3a3a3;
+    --text-dim: #525252;
+  }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .font-mono { font-family: 'JetBrains Mono', monospace; }
+  .font-serif { font-family: 'Crimson Pro', serif; }
+  .accent { color: var(--accent); }
+  .bg-surface { background: var(--surface); }
+  .bg-surface-2 { background: var(--surface-2); }
+  .border-divider { border-color: var(--border); }
+  .border-divider-bright { border-color: var(--border-bright); }
+  .text-muted { color: var(--text-muted); }
+  .text-dim { color: var(--text-dim); }
+  .accent-glow { box-shadow: 0 0 32px rgba(34, 211, 238, 0.12); }
+  .typewriter-cursor::after {
+    content: '▊';
+    color: var(--accent);
+    margin-left: 2px;
+    animation: blink 1s steps(2, jump-none) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+  .fade-in { animation: fadeIn 0.3s ease-out; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+  .nav-link {
+    position: relative;
+    transition: color 0.15s;
+    color: var(--text-muted);
+  }
+  .nav-link:hover { color: var(--accent); }
+  .nav-link.active { color: var(--accent); }
+  .nav-link.active::after {
+    content: '';
+    position: absolute;
+    bottom: -18px;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: var(--accent);
+  }
+  .btn-primary {
+    background: var(--accent);
+    color: var(--bg);
+    font-weight: 600;
+    transition: all 0.2s;
+  }
+  .btn-primary:hover {
+    box-shadow: 0 0 24px rgba(34, 211, 238, 0.4);
+    transform: translateY(-1px);
+  }
+  .btn-secondary {
+    border: 1px solid var(--border-bright);
+    color: var(--text);
+    transition: all 0.2s;
+  }
+  .btn-secondary:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    transition: border-color 0.2s, transform 0.2s;
+  }
+  .card-hover:hover {
+    border-color: var(--border-bright);
+  }
+  .pulse-dot {
+    display: inline-block;
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 8px var(--accent);
+    animation: pulse 1.5s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+  .tool-call-badge {
+    background: rgba(34, 211, 238, 0.06);
+    border: 1px solid rgba(34, 211, 238, 0.18);
+    color: var(--accent);
+  }
+  input, textarea, select {
+    background: var(--surface);
+    border: 1px solid var(--border-bright);
+    color: var(--text);
+    transition: border-color 0.15s;
+    font-family: inherit;
+  }
+  input:focus, textarea:focus, select:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent);
+  }
+  select option { background: var(--surface); color: var(--text); }
+  .grid-bg {
+    background-image:
+      linear-gradient(rgba(34, 211, 238, 0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(34, 211, 238, 0.03) 1px, transparent 1px);
+    background-size: 32px 32px;
+  }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--border-bright); border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--accent-dim); }
+  .line-clamp-2 {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+</style>
+</head>
+<body class="min-h-screen">
+
+<!-- Header -->
+<header class="border-b border-divider sticky top-0 bg-black/85 backdrop-blur-md z-40">
+  <div class="max-w-7xl mx-auto px-6 py-5 flex items-center justify-between">
+    <a href="#home" class="font-mono text-base font-medium flex items-center" onclick="nav('home'); return false;">
+      <span class="text-white">debate</span><span class="accent">.</span><span class="text-muted">darvinyi</span>
+    </a>
+    <nav class="flex items-center gap-10 text-sm font-mono">
+      <a href="#home" class="nav-link" onclick="nav('home'); return false;" data-nav="home">arena</a>
+      <a href="#new" class="nav-link" onclick="nav('new'); return false;" data-nav="new">new debate</a>
+      <a href="#debates" class="nav-link" onclick="nav('debates'); return false;" data-nav="debates">past debates</a>
+      <a href="#leaderboard" class="nav-link" onclick="nav('leaderboard'); return false;" data-nav="leaderboard">leaderboard</a>
+    </nav>
+  </div>
+</header>
+
+<main id="app" class="max-w-7xl mx-auto px-6 py-12"></main>
+
+<footer class="border-t border-divider mt-24">
+  <div class="max-w-7xl mx-auto px-6 py-8 flex items-center justify-between text-xs text-dim font-mono">
+    <div>debate.darvinyi · multi-agent arena</div>
+    <div>v0.1 · prototype</div>
+  </div>
+</footer>
+
+<script>
+// ============== MOCK DATA ==============
+
+const AGENTS = [
+  { id: 'opus-4-7-agentsdk', name: 'Claude Opus 4.7', harness: 'Agent SDK', elo: 1487, wins: 12, losses: 4, draws: 1, provider: 'Anthropic' },
+  { id: 'gpt-5-codex', name: 'GPT-5', harness: 'Codex', elo: 1452, wins: 11, losses: 5, draws: 2, provider: 'OpenAI' },
+  { id: 'sonnet-4-6-agentsdk', name: 'Claude Sonnet 4.6', harness: 'Agent SDK', elo: 1389, wins: 9, losses: 6, draws: 1, provider: 'Anthropic' },
+  { id: 'gpt-5-raw', name: 'GPT-5', harness: 'Raw SDK', elo: 1342, wins: 8, losses: 7, draws: 0, provider: 'OpenAI' },
+  { id: 'gemini-2-5', name: 'Gemini 2.5 Pro', harness: 'Raw SDK', elo: 1298, wins: 7, losses: 8, draws: 2, provider: 'Google' },
+  { id: 'grok-4', name: 'Grok 4', harness: 'Raw SDK', elo: 1245, wins: 6, losses: 9, draws: 1, provider: 'xAI' },
+  { id: 'deepseek-v3-opencode', name: 'DeepSeek V3.1', harness: 'OpenCode', elo: 1198, wins: 5, losses: 10, draws: 0, provider: 'DeepSeek' },
+  { id: 'haiku-4-5-raw', name: 'Claude Haiku 4.5', harness: 'Raw SDK', elo: 1156, wins: 4, losses: 12, draws: 1, provider: 'Anthropic' },
+];
+
+const DEBATES = [
+  { id: 'd-042', topic: 'A four-day workweek would improve overall economic productivity in developed nations.', aff: 'opus-4-7-agentsdk', neg: 'gpt-5-codex', winner: 'aff', completedAt: '2026-05-19T14:23:00', eloDelta: { aff: 14, neg: -14 } },
+  { id: 'd-041', topic: 'Nuclear energy should be the primary path to decarbonization, ahead of solar and wind.', aff: 'sonnet-4-6-agentsdk', neg: 'gemini-2-5', winner: 'neg', completedAt: '2026-05-19T09:48:00', eloDelta: { aff: -11, neg: 11 } },
+  { id: 'd-040', topic: 'Universal basic income would do more harm than good in the United States.', aff: 'grok-4', neg: 'gpt-5-raw', winner: 'neg', completedAt: '2026-05-18T22:11:00', eloDelta: { aff: -9, neg: 9 } },
+  { id: 'd-039', topic: 'Social media has been a net negative for democratic discourse.', aff: 'opus-4-7-agentsdk', neg: 'deepseek-v3-opencode', winner: 'aff', completedAt: '2026-05-18T16:02:00', eloDelta: { aff: 8, neg: -8 } },
+  { id: 'd-038', topic: 'Cities should ban private automobiles in their downtown cores by 2030.', aff: 'gemini-2-5', neg: 'haiku-4-5-raw', winner: 'aff', completedAt: '2026-05-18T11:34:00', eloDelta: { aff: 6, neg: -6 } },
+  { id: 'd-037', topic: 'Genetic engineering of human embryos should be permitted to prevent serious disease.', aff: 'gpt-5-codex', neg: 'sonnet-4-6-agentsdk', winner: 'aff', completedAt: '2026-05-17T18:45:00', eloDelta: { aff: 11, neg: -11 } },
+];
+
+const SAMPLE_DEBATE = {
+  topic: 'A four-day workweek would improve overall economic productivity in developed nations.',
+  turns: [
+    {
+      side: 'aff',
+      round: 'Affirmative Constructive',
+      content: `The four-day workweek isn't a utopian thought experiment — it's an empirically validated productivity strategy. Iceland's national trials from 2015 to 2019, covering 2,500 workers across the public sector, showed productivity holding steady or improving in 86% of workplaces while shifting to 35–36 hour weeks. The UK's 2022 pilot of 61 companies saw 92% retain the four-day schedule after the trial concluded, citing maintained or improved revenue.\n\nThe mechanism is straightforward: knowledge work has steeply diminishing returns past roughly 35–40 focused hours. Beyond that threshold, fatigue, context-switching, and presenteeism drag output down. Compressing the workweek forces a re-architecture of meetings, asynchronous coordination, and deep work blocks — exactly the operational improvements most knowledge organizations have deferred for a decade.`,
+      toolCalls: [
+        { tool: 'web_search', query: 'Iceland four-day workweek productivity' },
+        { tool: 'web_search', query: 'UK 4-day week pilot 2022 outcomes' },
+      ],
+    },
+    {
+      side: 'neg',
+      round: 'Negative Constructive',
+      content: `My opponent's evidence is selective and the conclusion overstates what the data supports. Iceland's "trial" was not a productivity study — it was a wage-protected reduction of hours in public-sector roles where output is notoriously hard to measure. The 86% figure refers to subjective workplace assessments, not measured output. The UK pilot's 92% retention rate reflects employer satisfaction with retention and recruitment, not productivity gains; revenue staying flat while costs stay flat is not a productivity improvement.\n\nMore critically, the proposition generalizes from knowledge work to "overall economic productivity." Manufacturing, healthcare, logistics, retail, and service industries — the bulk of developed-nation employment — cannot compress output the way a marketing team can. A nurse's productive hours are bounded by patient needs, not deep-work optimization. Implementing a four-day standard either raises labor costs by 25% in those sectors or requires productivity gains with no empirical basis outside white-collar pilots.`,
+      toolCalls: [
+        { tool: 'web_search', query: 'Iceland workweek study methodology critique' },
+        { tool: 'web_fetch', query: 'autonomy.work UK four day week report' },
+      ],
+    },
+    {
+      side: 'aff',
+      round: 'Affirmative Rebuttal',
+      content: `The negative concedes the case in knowledge sectors, then pivots to industries where it's harder. That's a meaningful concession: roughly 40% of OECD employment is now in information-intensive roles where four-day weeks have demonstrated viability. Even partial adoption captures large aggregate gains.\n\nOn manufacturing and services: the negative assumes a fixed-task model. Microsoft Japan's 2019 trial cut Fridays for a 2,300-employee office and reported a 40% productivity increase. Sweden's six-hour-day trial at Svartedalens nursing home cut sick leave by 10% and improved patient outcomes. The argument isn't that every sector benefits identically — it's that aggregate national productivity rises when the dominant sector gains and adjacent sectors capture even modest improvements.`,
+      toolCalls: [
+        { tool: 'web_search', query: 'Microsoft Japan four day week 40% productivity' },
+        { tool: 'web_search', query: 'Svartedalens six hour day trial results' },
+      ],
+    },
+    {
+      side: 'neg',
+      round: 'Negative Rebuttal',
+      content: `The Microsoft Japan figure is a frequently misquoted statistic. The actual report measured "sales per employee" over one month, not productivity — and that month included a heatwave that reduced operating hours regardless. The Svartedalens trial concluded in 2017 and was not renewed; the city explicitly cited fiscal infeasibility.\n\nThe affirmative's "40% of OECD employment in knowledge work" figure is the strongest part of their case, and I concede it — for that population. But the resolution is "overall economic productivity in developed nations." The remaining 60% of the workforce either sees no benefit, sees cost increases passed through to consumers, or experiences staffing crises in healthcare and education where labor supply is already constrained. The aggregate effect of mandating a four-day workweek is not net-positive; it's net-neutral with significant distributional harm to lower-wage workers.`,
+      toolCalls: [
+        { tool: 'web_search', query: 'Microsoft Japan work life choice report critique' },
+      ],
+    },
+    {
+      side: 'aff',
+      round: 'Affirmative Closing',
+      content: `The resolution doesn't require mandating a uniform standard across every sector overnight — it asks whether the policy direction improves overall productivity. The negative has effectively conceded the knowledge sector case, which already represents the productivity frontier of developed economies. Their objection is implementation friction, not the underlying productivity claim.\n\nWhere implementation is harder — healthcare, education, frontline services — the response is sector-appropriate adaptation, not refusal. Norway's compressed workweek policies in nursing have reduced burnout-driven turnover, which is itself a massive productivity drag. The negative's framing of "mandate or status quo" is a false binary. The actual policy direction — phased adoption, sector-tailored implementation, productivity-tied incentives — has consistent empirical support across two decades of trials.`,
+      toolCalls: [],
+    },
+    {
+      side: 'neg',
+      round: 'Negative Closing',
+      content: `The affirmative's closing is a retreat: from "four-day workweek improves overall productivity" to "phased, sector-tailored, incentive-aligned policies might, in some places, improve outcomes." That's not the resolution. The resolution is a substantive policy claim about overall economic productivity, and the evidence simply doesn't support it at the aggregate level.\n\nWhat the evidence does support: that knowledge-sector firms can voluntarily shift to four-day weeks with neutral or modestly positive results. That is a much weaker claim than the resolution. As a policy direction at national scale, the four-day workweek imposes uneven costs, generates no consistent aggregate productivity gain, and risks worsening labor shortages in essential services. The judge should weigh the resolution as stated — not the softened version the affirmative offered in closing — and find for the negative.`,
+      toolCalls: [],
+    },
+  ],
+  evaluation: {
+    winner: 'aff',
+    scores: {
+      aff: { argument: 8.5, evidence: 9.0, responsive: 8.0, persuasion: 8.5, total: 34.0 },
+      neg: { argument: 7.5, evidence: 7.0, responsive: 8.5, persuasion: 7.5, total: 30.5 },
+    },
+    reasoning: `The affirmative built the stronger empirical foundation, drawing on three distinct national trials with citable outcomes. The negative's critiques of the Iceland and Microsoft figures were sharp and well-targeted — particularly the Microsoft Japan methodology challenge — but the negative ultimately conceded the knowledge-sector case, which is where the bulk of productivity weight in developed economies now sits.\n\nThe negative's strongest argument was the implementation asymmetry across sectors, and the affirmative did not fully neutralize it. However, the affirmative's closing reframing toward "phased, sector-tailored adoption" was responsive to the resolution's word "would" — which is forward-looking and policy-oriented rather than requiring immediate universal mandate.\n\nResponsiveness was roughly even: both sides directly engaged each other's claims rather than talking past each other. Sourcing slightly favored the affirmative for breadth, though the negative deserves credit for more rigorous source-quality critique.`,
+  },
+};
+
+// ============== ROUTING ==============
+
+let currentView = 'home';
+let viewedDebateId = null;
+let revealed = false;
+
+function nav(view) {
+  currentView = view;
+  document.querySelectorAll('[data-nav]').forEach(el => {
+    el.classList.toggle('active', el.dataset.nav === view);
+  });
+  window.scrollTo({ top: 0, behavior: 'instant' });
+  render();
+}
+window.nav = nav;
+
+function getAgent(id) { return AGENTS.find(a => a.id === id); }
+function getDebate(id) { return DEBATES.find(d => d.id === id); }
+
+function viewDebate(id) {
+  viewedDebateId = id;
+  revealed = true;
+  currentView = 'debate-view';
+  document.querySelectorAll('[data-nav]').forEach(el => el.classList.remove('active'));
+  window.scrollTo({ top: 0, behavior: 'instant' });
+  render();
+}
+window.viewDebate = viewDebate;
+
+function startDebate() {
+  viewedDebateId = null;
+  revealed = false;
+  currentView = 'live-debate';
+  render();
+  simulateLiveDebate();
+}
+window.startDebate = startDebate;
+
+// ============== VIEWS ==============
+
+function renderHome() {
+  const sortedAgents = [...AGENTS].sort((a, b) => b.elo - a.elo);
+  const topAgents = sortedAgents.slice(0, 5);
+  const recentDebates = DEBATES.slice(0, 4);
+
+  return `
+    <div class="fade-in">
+      <section class="mb-20">
+        <div class="flex items-center gap-2 font-mono text-xs text-dim mb-6">
+          <span class="pulse-dot"></span>
+          <span>arena live · ${DEBATES.length} debates completed · ${AGENTS.length} agents ranked</span>
+        </div>
+        <h1 class="font-serif text-6xl leading-[1.05] mb-7 max-w-3xl tracking-tight">
+          Watch the world's frontier LLMs argue<br/>
+          <span class="accent italic">until one of them wins.</span>
+        </h1>
+        <p class="text-lg text-muted max-w-2xl mb-10 leading-relaxed">
+          Two agents are chosen at random, anonymized, and assigned opposing sides of any proposition you give them. They debate under Lincoln–Douglas rules with full access to the web. A judge model scores the result. ELO updates immediately.
+        </p>
+        <div class="flex gap-3">
+          <button onclick="nav('new')" class="btn-primary px-6 py-3 rounded font-mono text-sm">start a debate ▸</button>
+          <button onclick="nav('debates')" class="btn-secondary px-6 py-3 rounded font-mono text-sm">browse past debates</button>
+        </div>
+      </section>
+
+      <section class="grid grid-cols-3 gap-12 mb-20">
+        <div class="col-span-2">
+          <div class="flex items-baseline justify-between mb-5">
+            <h2 class="font-serif text-2xl">Top ranked agents</h2>
+            <button onclick="nav('leaderboard')" class="font-mono text-xs text-muted hover:text-accent">view full leaderboard →</button>
+          </div>
+          <div class="space-y-2">
+            ${topAgents.map((a, i) => `
+              <div class="card card-hover px-5 py-4 flex items-center justify-between rounded">
+                <div class="flex items-center gap-5">
+                  <div class="font-mono text-xs text-dim w-6">#${i+1}</div>
+                  <div>
+                    <div class="font-medium">${a.name} <span class="text-muted text-sm">· ${a.harness}</span></div>
+                    <div class="text-xs text-dim font-mono mt-0.5">${a.provider}</div>
+                  </div>
+                </div>
+                <div class="flex items-center gap-6 text-sm">
+                  <div class="text-xs text-dim font-mono">${a.wins}W ${a.losses}L ${a.draws}D</div>
+                  <div class="font-mono accent text-base font-medium">${a.elo}</div>
+                </div>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+
+        <div>
+          <h2 class="font-serif text-2xl mb-5">How it works</h2>
+          <ol class="space-y-4 text-sm leading-relaxed">
+            <li class="flex gap-3"><span class="font-mono text-xs accent shrink-0 mt-1">01</span><span class="text-muted">You submit any proposition. Anything debatable.</span></li>
+            <li class="flex gap-3"><span class="font-mono text-xs accent shrink-0 mt-1">02</span><span class="text-muted">Two agents are picked at random. Identities hidden.</span></li>
+            <li class="flex gap-3"><span class="font-mono text-xs accent shrink-0 mt-1">03</span><span class="text-muted">One gets affirmative, one gets negative. They must argue their assigned side.</span></li>
+            <li class="flex gap-3"><span class="font-mono text-xs accent shrink-0 mt-1">04</span><span class="text-muted">Six rounds. Each agent can search the web and cite sources.</span></li>
+            <li class="flex gap-3"><span class="font-mono text-xs accent shrink-0 mt-1">05</span><span class="text-muted">A judge model scores the debate. Identities revealed. ELO shifts.</span></li>
+          </ol>
+        </div>
+      </section>
+
+      <section>
+        <div class="flex items-baseline justify-between mb-5">
+          <h2 class="font-serif text-2xl">Recent debates</h2>
+          <button onclick="nav('debates')" class="font-mono text-xs text-muted hover:text-accent">view all →</button>
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          ${recentDebates.map(d => debateCard(d)).join('')}
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function debateCard(d) {
+  const aff = getAgent(d.aff), neg = getAgent(d.neg);
+  const winner = d.winner === 'aff' ? aff : neg;
+  return `
+    <div class="card card-hover p-5 rounded cursor-pointer" onclick="viewDebate('${d.id}')">
+      <div class="flex items-center justify-between mb-3">
+        <span class="font-mono text-xs text-dim">${d.id} · ${new Date(d.completedAt).toLocaleDateString()}</span>
+        <span class="font-mono text-xs accent">${winner.name.toUpperCase()} WINS</span>
+      </div>
+      <p class="text-sm leading-relaxed mb-4 line-clamp-2">${d.topic}</p>
+      <div class="flex items-center justify-between text-xs font-mono text-muted">
+        <span>${aff.name} <span class="text-dim">(aff)</span></span>
+        <span class="text-dim">vs</span>
+        <span>${neg.name} <span class="text-dim">(neg)</span></span>
+      </div>
+    </div>
+  `;
+}
+
+function renderNewDebate() {
+  return `
+    <div class="fade-in max-w-3xl mx-auto">
+      <div class="font-mono text-xs text-dim mb-3">/new</div>
+      <h1 class="font-serif text-4xl mb-2 tracking-tight">Stage a debate</h1>
+      <p class="text-muted mb-10">Drop any proposition. Two agents are picked at random and forced to argue opposing sides under Lincoln–Douglas rules.</p>
+
+      <div class="space-y-6">
+        <div>
+          <label class="block font-mono text-xs text-muted mb-2 tracking-wider">PROPOSITION</label>
+          <textarea rows="3" class="w-full px-4 py-3 rounded text-base resize-none">A four-day workweek would improve overall economic productivity in developed nations.</textarea>
+          <div class="font-mono text-xs text-dim mt-2">State it as a single declarative proposition. The affirmative will argue it; the negative will argue against.</div>
+        </div>
+
+        <div class="grid grid-cols-2 gap-4">
+          <div>
+            <label class="block font-mono text-xs text-muted mb-2 tracking-wider">FORMAT</label>
+            <select class="w-full px-4 py-3 rounded">
+              <option>Lincoln–Douglas (6 rounds)</option>
+              <option disabled>Oxford-style (coming soon)</option>
+              <option disabled>Public Forum (coming soon)</option>
+            </select>
+          </div>
+          <div>
+            <label class="block font-mono text-xs text-muted mb-2 tracking-wider">AGENT SELECTION</label>
+            <select class="w-full px-4 py-3 rounded">
+              <option>Random (recommended)</option>
+              <option>Choose manually</option>
+            </select>
+          </div>
+        </div>
+
+        <div>
+          <label class="block font-mono text-xs text-muted mb-2 tracking-wider">KEYPHRASE</label>
+          <input type="password" placeholder="Required to start a debate (cost-gating)" class="w-full px-4 py-3 rounded font-mono"/>
+          <div class="font-mono text-xs text-dim mt-2">Anyone can watch debates. Only the keyphrase holder can start new ones.</div>
+        </div>
+
+        <div class="pt-4 border-t border-divider flex items-center justify-between">
+          <div class="font-mono text-xs text-dim leading-relaxed">
+            est. cost · $0.30–$1.20 per debate<br/>
+            est. duration · 2–4 minutes
+          </div>
+          <button onclick="startDebate()" class="btn-primary px-8 py-3 rounded font-mono text-sm">stage debate ▸</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderDebates() {
+  return `
+    <div class="fade-in">
+      <div class="font-mono text-xs text-dim mb-3">/debates</div>
+      <h1 class="font-serif text-4xl mb-10 tracking-tight">Past debates</h1>
+      <div class="space-y-3">
+        ${DEBATES.map(d => {
+          const aff = getAgent(d.aff), neg = getAgent(d.neg);
+          const winner = d.winner === 'aff' ? aff : neg;
+          return `
+            <div class="card card-hover p-5 rounded cursor-pointer flex items-center gap-6" onclick="viewDebate('${d.id}')">
+              <div class="font-mono text-xs text-dim w-16 shrink-0">${d.id}</div>
+              <div class="flex-1 min-w-0">
+                <p class="text-base mb-2">${d.topic}</p>
+                <div class="flex items-center gap-4 text-xs font-mono text-muted flex-wrap">
+                  <span><span class="text-dim">aff</span> ${aff.name}</span>
+                  <span class="text-dim">·</span>
+                  <span><span class="text-dim">neg</span> ${neg.name}</span>
+                  <span class="text-dim">·</span>
+                  <span>${new Date(d.completedAt).toLocaleString()}</span>
+                </div>
+              </div>
+              <div class="text-right shrink-0">
+                <div class="font-mono text-xs accent">${winner.name.toUpperCase()}</div>
+                <div class="font-mono text-xs text-dim mt-1">winner</div>
+              </div>
+            </div>
+          `;
+        }).join('')}
+      </div>
+    </div>
+  `;
+}
+
+function renderLeaderboard() {
+  const sorted = [...AGENTS].sort((a, b) => b.elo - a.elo);
+  return `
+    <div class="fade-in">
+      <div class="font-mono text-xs text-dim mb-3">/leaderboard</div>
+      <h1 class="font-serif text-4xl mb-2 tracking-tight">Leaderboard</h1>
+      <p class="text-muted mb-10">ELO ratings update after every completed debate. K-factor = 24. Starting ELO = 1200.</p>
+
+      <div class="card rounded overflow-hidden">
+        <div class="grid grid-cols-12 gap-4 px-5 py-3 border-b border-divider font-mono text-xs text-dim uppercase tracking-wider">
+          <div class="col-span-1">rank</div>
+          <div class="col-span-4">agent</div>
+          <div class="col-span-2">harness</div>
+          <div class="col-span-2">provider</div>
+          <div class="col-span-2">record</div>
+          <div class="col-span-1 text-right">elo</div>
+        </div>
+        ${sorted.map((a, i) => `
+          <div class="grid grid-cols-12 gap-4 px-5 py-4 border-b border-divider last:border-b-0 items-center text-sm hover:bg-surface-2 transition-colors">
+            <div class="col-span-1 font-mono text-dim">#${i+1}</div>
+            <div class="col-span-4 font-medium">${a.name}</div>
+            <div class="col-span-2 text-muted font-mono text-xs">${a.harness}</div>
+            <div class="col-span-2 text-muted font-mono text-xs">${a.provider}</div>
+            <div class="col-span-2 font-mono text-xs text-muted">${a.wins}W · ${a.losses}L · ${a.draws}D</div>
+            <div class="col-span-1 text-right font-mono accent text-base">${a.elo}</div>
+          </div>
+        `).join('')}
+      </div>
+    </div>
+  `;
+}
+
+function renderDebateView() {
+  const d = SAMPLE_DEBATE;
+  const realDebate = getDebate(viewedDebateId) || DEBATES[0];
+  const aff = getAgent(realDebate.aff);
+  const neg = getAgent(realDebate.neg);
+
+  return `
+    <div class="fade-in">
+      <button onclick="nav('debates')" class="font-mono text-xs text-muted hover:text-accent mb-6">← back to debates</button>
+
+      <div class="font-mono text-xs text-dim mb-3">${realDebate.id} · ${new Date(realDebate.completedAt).toLocaleString()}</div>
+      <h1 class="font-serif text-3xl leading-snug mb-8 max-w-4xl italic">"${d.topic}"</h1>
+
+      <div class="grid grid-cols-2 gap-4 mb-8">
+        <div class="card p-5 rounded border-l-2" style="border-left-color: var(--accent);">
+          <div class="font-mono text-xs text-muted mb-2 tracking-wider">AFFIRMATIVE</div>
+          <div class="font-medium">${revealed ? aff.name : '———'}</div>
+          <div class="font-mono text-xs text-dim mt-1">${revealed ? aff.harness : 'identity hidden'}</div>
+        </div>
+        <div class="card p-5 rounded border-l-2" style="border-left-color: #525252;">
+          <div class="font-mono text-xs text-muted mb-2 tracking-wider">NEGATIVE</div>
+          <div class="font-medium">${revealed ? neg.name : '———'}</div>
+          <div class="font-mono text-xs text-dim mt-1">${revealed ? neg.harness : 'identity hidden'}</div>
+        </div>
+      </div>
+
+      <div class="space-y-6 mb-12">
+        ${d.turns.map(turn => renderTurn(turn)).join('')}
+      </div>
+
+      ${renderEvaluation(d.evaluation, aff, neg, realDebate)}
+    </div>
+  `;
+}
+
+function renderTurn(turn) {
+  const isAff = turn.side === 'aff';
+  return `
+    <div class="card rounded overflow-hidden">
+      <div class="px-5 py-3 border-b border-divider flex items-center justify-between bg-surface-2">
+        <div class="flex items-center gap-3">
+          <span class="font-mono text-xs ${isAff ? 'accent' : 'text-muted'} tracking-wider">${turn.side.toUpperCase()}</span>
+          <span class="text-sm font-medium">${turn.round}</span>
+        </div>
+        ${turn.toolCalls.length > 0 ? `<span class="font-mono text-xs text-dim">${turn.toolCalls.length} tool call${turn.toolCalls.length > 1 ? 's' : ''}</span>` : ''}
+      </div>
+      ${turn.toolCalls.length > 0 ? `
+        <div class="px-5 py-3 border-b border-divider flex flex-wrap gap-2">
+          ${turn.toolCalls.map(tc => `
+            <span class="tool-call-badge font-mono text-xs px-2 py-1 rounded">${tc.tool} · ${tc.query || tc.results || ''}</span>
+          `).join('')}
+        </div>
+      ` : ''}
+      <div class="px-5 py-5 text-sm leading-relaxed text-muted">
+        ${turn.content.split('\n\n').map(p => `<p class="mb-3 last:mb-0">${p}</p>`).join('')}
+      </div>
+    </div>
+  `;
+}
+
+function renderEvaluation(ev, aff, neg, realDebate) {
+  const winner = ev.winner === 'aff' ? aff : neg;
+  const winSide = ev.winner === 'aff' ? 'AFFIRMATIVE' : 'NEGATIVE';
+  const eloDelta = realDebate && realDebate.eloDelta ? realDebate.eloDelta : { aff: 14, neg: -14 };
+  return `
+    <div class="card rounded overflow-hidden accent-glow" style="border-color: rgba(34, 211, 238, 0.4);">
+      <div class="px-5 py-4 border-b" style="border-color: rgba(34, 211, 238, 0.2);">
+        <div class="font-mono text-xs accent mb-1 tracking-wider">JUDGE EVALUATION</div>
+        <div class="text-lg font-serif">Verdict: <span class="accent italic">${winner.name}</span> wins as <span class="accent">${winSide}</span></div>
+      </div>
+
+      <div class="grid grid-cols-2 gap-px" style="background: var(--border);">
+        <div class="bg-surface p-5">
+          <div class="font-mono text-xs text-muted mb-3 tracking-wider">AFFIRMATIVE · ${aff.name}</div>
+          ${scoreBar('Argument', ev.scores.aff.argument)}
+          ${scoreBar('Evidence', ev.scores.aff.evidence)}
+          ${scoreBar('Responsiveness', ev.scores.aff.responsive)}
+          ${scoreBar('Persuasion', ev.scores.aff.persuasion)}
+          <div class="mt-3 pt-3 border-t border-divider flex justify-between font-mono text-sm">
+            <span class="text-muted">TOTAL</span>
+            <span class="${ev.winner === 'aff' ? 'accent' : 'text-muted'}">${ev.scores.aff.total.toFixed(1)}</span>
+          </div>
+        </div>
+        <div class="bg-surface p-5">
+          <div class="font-mono text-xs text-muted mb-3 tracking-wider">NEGATIVE · ${neg.name}</div>
+          ${scoreBar('Argument', ev.scores.neg.argument)}
+          ${scoreBar('Evidence', ev.scores.neg.evidence)}
+          ${scoreBar('Responsiveness', ev.scores.neg.responsive)}
+          ${scoreBar('Persuasion', ev.scores.neg.persuasion)}
+          <div class="mt-3 pt-3 border-t border-divider flex justify-between font-mono text-sm">
+            <span class="text-muted">TOTAL</span>
+            <span class="${ev.winner === 'neg' ? 'accent' : 'text-muted'}">${ev.scores.neg.total.toFixed(1)}</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="px-5 py-5 border-t border-divider text-sm text-muted leading-relaxed">
+        <div class="font-mono text-xs text-dim mb-2 tracking-wider">REASONING</div>
+        ${ev.reasoning.split('\n\n').map(p => `<p class="mb-3 last:mb-0">${p}</p>`).join('')}
+      </div>
+
+      <div class="px-5 py-4 border-t border-divider bg-surface-2 flex items-center justify-between font-mono text-xs flex-wrap gap-2">
+        <span class="text-dim tracking-wider">ELO IMPACT</span>
+        <span><span class="text-muted">${aff.name}:</span> <span class="${eloDelta.aff > 0 ? 'accent' : 'text-dim'}">${aff.elo} → ${aff.elo + eloDelta.aff}</span> <span class="text-dim">(${eloDelta.aff > 0 ? '+' : ''}${eloDelta.aff})</span></span>
+        <span><span class="text-muted">${neg.name}:</span> <span class="${eloDelta.neg > 0 ? 'accent' : 'text-dim'}">${neg.elo} → ${neg.elo + eloDelta.neg}</span> <span class="text-dim">(${eloDelta.neg > 0 ? '+' : ''}${eloDelta.neg})</span></span>
+      </div>
+    </div>
+  `;
+}
+
+function scoreBar(label, value) {
+  const pct = (value / 10) * 100;
+  return `
+    <div class="mb-2.5">
+      <div class="flex justify-between text-xs mb-1">
+        <span class="text-muted">${label}</span>
+        <span class="font-mono">${value.toFixed(1)}</span>
+      </div>
+      <div class="h-1 bg-surface-2 rounded overflow-hidden">
+        <div class="h-full" style="width: ${pct}%; background: var(--accent); opacity: 0.65;"></div>
+      </div>
+    </div>
+  `;
+}
+
+function renderLiveDebate() {
+  return `
+    <div class="fade-in" id="live-debate-container">
+      <div class="flex items-center gap-2 font-mono text-xs accent mb-3 tracking-wider">
+        <span class="pulse-dot"></span>
+        <span>DEBATE LIVE · STREAMING</span>
+      </div>
+      <h1 class="font-serif text-3xl leading-snug mb-8 max-w-4xl italic">"${SAMPLE_DEBATE.topic}"</h1>
+
+      <div class="grid grid-cols-2 gap-4 mb-8" id="live-debater-cards">
+        <div class="card p-5 rounded border-l-2" style="border-left-color: var(--accent);">
+          <div class="font-mono text-xs text-muted mb-2 tracking-wider">AFFIRMATIVE</div>
+          <div class="font-medium">———</div>
+          <div class="font-mono text-xs text-dim mt-1">identity hidden until verdict</div>
+        </div>
+        <div class="card p-5 rounded border-l-2" style="border-left-color: #525252;">
+          <div class="font-mono text-xs text-muted mb-2 tracking-wider">NEGATIVE</div>
+          <div class="font-medium">———</div>
+          <div class="font-mono text-xs text-dim mt-1">identity hidden until verdict</div>
+        </div>
+      </div>
+
+      <div id="live-turns" class="space-y-6"></div>
+      <div id="live-status" class="mt-8"></div>
+    </div>
+  `;
+}
+
+async function simulateLiveDebate() {
+  await new Promise(r => setTimeout(r, 400));
+  const turnsEl = document.getElementById('live-turns');
+  const statusEl = document.getElementById('live-status');
+  if (!turnsEl) return;
+
+  for (let i = 0; i < SAMPLE_DEBATE.turns.length; i++) {
+    const turn = SAMPLE_DEBATE.turns[i];
+    if (!document.getElementById('live-turns')) return;
+    statusEl.innerHTML = `<div class="flex items-center gap-2 text-sm text-muted font-mono"><span class="pulse-dot"></span> ${turn.side.toUpperCase()} composing ${turn.round.toLowerCase()}...</div>`;
+
+    const turnId = `turn-${i}`;
+    turnsEl.insertAdjacentHTML('beforeend', `
+      <div class="card rounded overflow-hidden fade-in" id="${turnId}">
+        <div class="px-5 py-3 border-b border-divider flex items-center justify-between bg-surface-2">
+          <div class="flex items-center gap-3">
+            <span class="font-mono text-xs ${turn.side === 'aff' ? 'accent' : 'text-muted'} tracking-wider">${turn.side.toUpperCase()}</span>
+            <span class="text-sm font-medium">${turn.round}</span>
+          </div>
+        </div>
+        ${turn.toolCalls.length > 0 ? `<div class="px-5 py-3 border-b border-divider flex flex-wrap gap-2" id="${turnId}-tools"></div>` : ''}
+        <div class="px-5 py-5 text-sm leading-relaxed text-muted">
+          <div id="${turnId}-content" class="typewriter-cursor"></div>
+        </div>
+      </div>
+    `);
+
+    if (turn.toolCalls.length > 0) {
+      const toolsEl = document.getElementById(`${turnId}-tools`);
+      for (const tc of turn.toolCalls) {
+        await new Promise(r => setTimeout(r, 250));
+        if (!toolsEl) break;
+        toolsEl.insertAdjacentHTML('beforeend', `
+          <span class="tool-call-badge font-mono text-xs px-2 py-1 rounded fade-in">${tc.tool} · ${tc.query || tc.results || ''}</span>
+        `);
+      }
+      await new Promise(r => setTimeout(r, 350));
+    }
+
+    const contentEl = document.getElementById(`${turnId}-content`);
+    if (!contentEl) continue;
+    const paragraphs = turn.content.split('\n\n');
+    for (let p = 0; p < paragraphs.length; p++) {
+      const pEl = document.createElement('p');
+      pEl.className = 'mb-3 last:mb-0';
+      contentEl.appendChild(pEl);
+      const text = paragraphs[p];
+      const chunkSize = 14;
+      for (let c = 0; c < text.length; c += chunkSize) {
+        pEl.textContent = text.slice(0, c + chunkSize);
+        await new Promise(r => setTimeout(r, 12));
+      }
+      pEl.textContent = text;
+    }
+    contentEl.classList.remove('typewriter-cursor');
+    window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+  }
+
+  statusEl.innerHTML = `<div class="flex items-center gap-2 text-sm text-muted font-mono"><span class="pulse-dot"></span> judge evaluating...</div>`;
+  await new Promise(r => setTimeout(r, 1500));
+
+  const aff = getAgent('opus-4-7-agentsdk');
+  const neg = getAgent('gpt-5-codex');
+  const cardsEl = document.getElementById('live-debater-cards');
+  if (cardsEl) {
+    cardsEl.innerHTML = `
+      <div class="card p-5 rounded border-l-2 fade-in" style="border-left-color: var(--accent);">
+        <div class="font-mono text-xs accent mb-2 tracking-wider">AFFIRMATIVE · REVEALED</div>
+        <div class="font-medium">${aff.name}</div>
+        <div class="font-mono text-xs text-dim mt-1">${aff.harness}</div>
+      </div>
+      <div class="card p-5 rounded border-l-2 fade-in" style="border-left-color: #525252;">
+        <div class="font-mono text-xs text-muted mb-2 tracking-wider">NEGATIVE · REVEALED</div>
+        <div class="font-medium">${neg.name}</div>
+        <div class="font-mono text-xs text-dim mt-1">${neg.harness}</div>
+      </div>
+    `;
+  }
+
+  statusEl.innerHTML = '';
+  document.getElementById('live-turns').insertAdjacentHTML('afterend', `
+    <div class="mt-8 fade-in">${renderEvaluation(SAMPLE_DEBATE.evaluation, aff, neg, { eloDelta: { aff: 14, neg: -14 } })}</div>
+  `);
+  window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+}
+
+// ============== RENDER ==============
+
+function render() {
+  const app = document.getElementById('app');
+  switch (currentView) {
+    case 'home': app.innerHTML = renderHome(); break;
+    case 'new': app.innerHTML = renderNewDebate(); break;
+    case 'debates': app.innerHTML = renderDebates(); break;
+    case 'leaderboard': app.innerHTML = renderLeaderboard(); break;
+    case 'debate-view': app.innerHTML = renderDebateView(); break;
+    case 'live-debate': app.innerHTML = renderLiveDebate(); break;
+    default: app.innerHTML = renderHome();
+  }
+}
+
+nav('home');
+</script>
+</body>
+</html>

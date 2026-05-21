@@ -1,0 +1,28 @@
+{
+  "name": "darvinyi-debate-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Express backend for the darvinyi-debate platform",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "nodemon src/index.js",
+    "start": "node src/index.js",
+    "seed": "node src/seed.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "latest",
+    "@google/genai": "latest",
+    "@prisma/client": "latest",
+    "cheerio": "^1.0.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "openai": "latest",
+    "undici": "^6.20.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0",
+    "prisma": "latest"
+  }
+}
