@@ -1,19 +1,24 @@
-// /api/debates — public read endpoints plus the POST placeholder (real
-// implementation in Prompt 12; keyphrase + rate-limit gating is wired here).
+// /api/debates — read endpoints + create + stream
 //
-// GET /               — paginated list of debates
-// GET /:id            — full debate detail (turns, evaluation, ELO changes)
-// POST /              — placeholder (501) behind auth + rate limit
+// Endpoints:
+//   GET  /                — paginated list (from Prompt 5)
+//   GET  /:id             — full debate detail (from Prompt 5)
+//   POST /                — create a new debate (keyphrase + rate limit gated)
+//   GET  /:id/stream      — Server-Sent Events stream of debate events
 //
-// Cursor pagination via ?before=<ISO completedAt>. Default page size 20,
-// max 100. By default only `completed` debates are returned; pass
-// ?status=all to include all statuses, or ?status=in_progress for a specific
-// one.
+// Stream semantics by debate status:
+//   pending      → run the orchestrator, push events live, end on all_rounds_complete
+//   in_progress  → replay saved turns, then emit an info `error` event explaining
+//                  that the debate is running in another session, close
+//   completed    → replay all saved state (turns + reveal) instantly, close
+//   failed       → replay saved turns, emit error event, close
 
 import { Router } from 'express';
 import { requireKeyphrase } from '../middleware/auth.js';
 import { rateLimit } from '../middleware/rateLimit.js';
 import { prisma } from '../db.js';
+import { pickRandomAgents } from '../orchestrator/pickAgents.js';
+import { runDebate } from '../orchestrator/runDebate.js';
 
 const router = Router();
 
@@ -21,25 +26,16 @@ const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
 const VALID_STATUSES = ['pending', 'in_progress', 'completed', 'failed'];
 
-/**
- * GET /api/debates
- * Query params:
- *   limit  — number, default 20, max 100
- *   before — ISO datetime; returns debates with completedAt < this value
- *   status — one of {pending, in_progress, completed, failed, all}; default 'completed'
- *
- * Returns: { debates: Array<DebateSummary>, nextCursor: ISO | null }
- *
- * DebateSummary = {
- *   id, topic, status, winner,
- *   affAgent: { id, displayName },
- *   negAgent: { id, displayName },
- *   createdAt (ISO), completedAt (ISO | null)
- * }
- */
+const HEARTBEAT_INTERVAL_MS = 15_000;
+const MIN_TOPIC_LENGTH = 5;
+const MAX_TOPIC_LENGTH = 500;
+
+// ============================================================================
+// GET /api/debates — list (from Prompt 5, unchanged)
+// ============================================================================
+
 router.get('/', async (req, res, next) => {
   try {
-    // Parse limit
     let limit = DEFAULT_LIMIT;
     if (req.query.limit !== undefined) {
       const parsed = Number.parseInt(req.query.limit, 10);
@@ -49,7 +45,6 @@ router.get('/', async (req, res, next) => {
       limit = Math.min(parsed, MAX_LIMIT);
     }
 
-    // Parse before
     let beforeDate = null;
     if (req.query.before !== undefined) {
       const d = new Date(req.query.before);
@@ -59,11 +54,10 @@ router.get('/', async (req, res, next) => {
       beforeDate = d;
     }
 
-    // Parse status
     const statusParam = req.query.status;
     const where = {};
     if (statusParam === 'all') {
-      // no status filter
+      // no filter
     } else if (statusParam !== undefined) {
       if (!VALID_STATUSES.includes(statusParam)) {
         return res.status(400).json({
@@ -89,8 +83,6 @@ router.get('/', async (req, res, next) => {
       take: limit,
     });
 
-    // nextCursor only set if we returned a full page and the last row has a
-    // completedAt (debates without completedAt can't be used as cursors).
     let nextCursor = null;
     if (debates.length === limit) {
       const last = debates[debates.length - 1];
@@ -117,17 +109,10 @@ router.get('/', async (req, res, next) => {
   }
 });
 
-/**
- * GET /api/debates/:id
- * Returns: { debate, turns, evaluation, eloChanges }
- *
- * Scores in evaluation are renamed for the API: Prisma `affResponsive` becomes
- * `responsive` under `affScores`, and `affPersuasion` becomes `persuasion`,
- * etc. This keeps the API consistent with the frontend usage.
- *
- * `errorMessage` is NEVER returned in this response (may contain internal
- * info on failed debates).
- */
+// ============================================================================
+// GET /api/debates/:id — detail (from Prompt 5, unchanged)
+// ============================================================================
+
 router.get('/:id', async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -147,7 +132,7 @@ router.get('/:id', async (req, res, next) => {
       return res.status(404).json({ error: 'Debate not found' });
     }
 
-    const response = {
+    res.json({
       debate: {
         id: debate.id,
         topic: debate.topic,
@@ -197,26 +182,276 @@ router.get('/:id', async (req, res, next) => {
         after: c.after,
         delta: c.delta,
       })),
-    };
-
-    res.json(response);
+    });
   } catch (err) {
     next(err);
   }
 });
 
-/**
- * POST /api/debates — placeholder.
- * Auth + rate limit are wired here so the full request path can be tested
- * before the orchestrator is implemented in Prompt 12.
- */
+// ============================================================================
+// POST /api/debates — create a new debate
+// ============================================================================
+
 router.post(
   '/',
   requireKeyphrase,
   rateLimit({ max: 3, windowMs: 24 * 60 * 60 * 1000 }),
-  (req, res) => {
-    res.status(501).json({ error: 'Not implemented yet' });
+  async (req, res, next) => {
+    try {
+      const body = req.body ?? {};
+      const rawTopic = body.topic;
+      const rerunOf = body.rerunOf;
+
+      let topic;
+
+      if (rerunOf !== undefined && rerunOf !== null && rerunOf !== '') {
+        if (typeof rerunOf !== 'string') {
+          return res.status(400).json({ error: 'rerunOf must be a string debate id' });
+        }
+        const source = await prisma.debate.findUnique({
+          where: { id: rerunOf },
+          select: { topic: true },
+        });
+        if (!source) {
+          return res.status(404).json({ error: 'Source debate for rerun not found' });
+        }
+        topic = source.topic;
+      } else {
+        if (typeof rawTopic !== 'string') {
+          return res.status(400).json({ error: 'topic is required and must be a string' });
+        }
+        topic = rawTopic.trim();
+        if (topic.length < MIN_TOPIC_LENGTH) {
+          return res.status(400).json({ error: `topic must be at least ${MIN_TOPIC_LENGTH} characters` });
+        }
+        if (topic.length > MAX_TOPIC_LENGTH) {
+          return res.status(400).json({ error: `topic must be at most ${MAX_TOPIC_LENGTH} characters` });
+        }
+      }
+
+      const { affAgent, negAgent } = await pickRandomAgents();
+
+      const debate = await prisma.debate.create({
+        data: {
+          topic,
+          status: 'pending',
+          affAgentId: affAgent.id,
+          negAgentId: negAgent.id,
+        },
+      });
+
+      res.status(201).json({ debateId: debate.id });
+    } catch (err) {
+      next(err);
+    }
   },
 );
+
+// ============================================================================
+// GET /api/debates/:id/stream — SSE
+// ============================================================================
+
+router.get('/:id/stream', async (req, res) => {
+  const { id } = req.params;
+
+  // Pre-flight: confirm debate exists. Done as a JSON 404 BEFORE switching to SSE.
+  const debate = await prisma.debate.findUnique({
+    where: { id },
+    include: {
+      affAgent: { select: { id: true, displayName: true, provider: true, modelId: true } },
+      negAgent: { select: { id: true, displayName: true, provider: true, modelId: true } },
+      turns: { orderBy: { roundNumber: 'asc' } },
+      evaluation: true,
+      eloChanges: true,
+    },
+  });
+
+  if (!debate) {
+    return res.status(404).json({ error: 'Debate not found' });
+  }
+
+  // Switch to SSE.
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // disable nginx/proxy buffering
+  res.flushHeaders();
+
+  const send = (eventType, payload) => {
+    if (res.writableEnded || res.destroyed) return;
+    res.write(`event: ${eventType}\n`);
+    res.write(`data: ${JSON.stringify(payload ?? {})}\n\n`);
+  };
+
+  // Heartbeat every 15s so proxies don't close idle connections.
+  const heartbeat = setInterval(() => {
+    if (res.writableEnded || res.destroyed) return;
+    res.write(`: heartbeat ${Date.now()}\n\n`);
+  }, HEARTBEAT_INTERVAL_MS);
+  heartbeat.unref?.();
+
+  // Abort the orchestrator if the client disconnects.
+  const abortController = new AbortController();
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    if (!abortController.signal.aborted) {
+      abortController.abort();
+    }
+  });
+
+  const finish = () => {
+    clearInterval(heartbeat);
+    if (!res.writableEnded) res.end();
+  };
+
+  try {
+    // ------------------------------------------------------------------------
+    // status: completed — replay everything instantly, then close.
+    // ------------------------------------------------------------------------
+    if (debate.status === 'completed') {
+      replayCompletedDebate(send, debate);
+      return finish();
+    }
+
+    // ------------------------------------------------------------------------
+    // status: failed — replay turns + error, then close.
+    // ------------------------------------------------------------------------
+    if (debate.status === 'failed') {
+      replayPartialDebate(send, debate);
+      send('error', {
+        message: debate.errorMessage
+          ? `Debate failed: ${debate.errorMessage}`
+          : 'Debate failed',
+      });
+      return finish();
+    }
+
+    // ------------------------------------------------------------------------
+    // status: in_progress — replay saved turns, advise client, close.
+    // (v1 does not support attaching mid-stream to a running debate.)
+    // ------------------------------------------------------------------------
+    if (debate.status === 'in_progress') {
+      replayPartialDebate(send, debate);
+      send('error', {
+        message:
+          'Debate is currently in progress in another session. Refresh in a moment to load the final result.',
+      });
+      return finish();
+    }
+
+    // ------------------------------------------------------------------------
+    // status: pending — run the orchestrator and stream live.
+    // ------------------------------------------------------------------------
+
+    // Track which round_complete events fired so the final reveal can include them.
+    // (Used by Prompts 13 and 14 when they extend this handler with judge + ELO.)
+    let orchestratorDone = false;
+
+    await runDebate({
+      debateId: id,
+      signal: abortController.signal,
+      onEvent: (event) => {
+        // Forward every orchestrator event to the SSE client by its type.
+        send(event.type, event);
+        if (event.type === 'all_rounds_complete') {
+          orchestratorDone = true;
+        }
+      },
+    });
+
+    // ------------------------------------------------------------------------
+    // After orchestrator: judge + ELO + final debate_complete reveal.
+    // (Added in Prompts 13 and 14. For Prompt 12, we end here with a minimal
+    // debate_complete that just reveals identities.)
+    // ------------------------------------------------------------------------
+    if (orchestratorDone) {
+      // Refetch agent info — orchestrator didn't return them, but we have them above.
+      send('debate_complete', {
+        debateId: id,
+        topic: debate.topic,
+        affAgent: debate.affAgent,
+        negAgent: debate.negAgent,
+        winner: null,        // populated in Prompt 13 (judge)
+        evaluation: null,    // populated in Prompt 13
+        eloChanges: [],      // populated in Prompt 14
+      });
+    }
+
+    finish();
+  } catch (err) {
+    // Orchestrator threw (or another step failed). The orchestrator marks the
+    // debate as failed itself; we just emit a stream error and close.
+    if (!res.writableEnded) {
+      const msg = err?.name === 'AbortError' ? 'Connection aborted' : `Stream error: ${err?.message ?? 'unknown'}`;
+      send('error', { message: msg });
+    }
+    finish();
+  }
+});
+
+// ============================================================================
+// Replay helpers
+// ============================================================================
+
+function replayPartialDebate(send, debate) {
+  send('debate_start', { debateId: debate.id, topic: debate.topic });
+  for (const t of debate.turns) {
+    send('round_complete', {
+      type: 'round_complete',
+      round: t.roundNumber,
+      side: t.side,
+      content: t.content,
+      toolCalls: t.toolCalls ?? [],
+      tokensIn: t.tokensIn ?? 0,
+      tokensOut: t.tokensOut ?? 0,
+      durationMs: t.durationMs ?? 0,
+      resumed: true,
+    });
+  }
+}
+
+function replayCompletedDebate(send, debate) {
+  replayPartialDebate(send, debate);
+  send('all_rounds_complete', {});
+
+  // Evaluation + ELO are populated by Prompts 13 and 14 once those modules exist.
+  // For a Prompt-12-only build, debate.evaluation and debate.eloChanges may be
+  // empty. We still send debate_complete with whatever's available so the
+  // client can render the reveal.
+  send('debate_complete', {
+    debateId: debate.id,
+    topic: debate.topic,
+    affAgent: debate.affAgent,
+    negAgent: debate.negAgent,
+    winner: debate.winner,
+    evaluation: debate.evaluation
+      ? {
+          winner: debate.evaluation.winner,
+          affScores: {
+            argument: debate.evaluation.affArgument,
+            evidence: debate.evaluation.affEvidence,
+            responsive: debate.evaluation.affResponsive,
+            persuasion: debate.evaluation.affPersuasion,
+            total: debate.evaluation.affTotal,
+          },
+          negScores: {
+            argument: debate.evaluation.negArgument,
+            evidence: debate.evaluation.negEvidence,
+            responsive: debate.evaluation.negResponsive,
+            persuasion: debate.evaluation.negPersuasion,
+            total: debate.evaluation.negTotal,
+          },
+          reasoning: debate.evaluation.reasoning,
+          judgeModel: debate.evaluation.judgeModel,
+        }
+      : null,
+    eloChanges: (debate.eloChanges || []).map((c) => ({
+      agentId: c.agentId,
+      before: c.before,
+      after: c.after,
+      delta: c.delta,
+    })),
+  });
+}
 
 export default router;
