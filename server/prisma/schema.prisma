@@ -129,6 +129,12 @@ model Evaluation {
   negTotal      Float
   reasoning     String   @db.Text
   judgeModel    String
+
+  // Human vote (optional override of the judge's verdict)
+  humanWinner          String?
+  humanVotedAt         DateTime?
+  humanAgreedWithJudge Boolean?
+
   createdAt     DateTime @default(now())
 }
 

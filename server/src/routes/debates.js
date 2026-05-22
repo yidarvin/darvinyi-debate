@@ -21,6 +21,7 @@ import { pickRandomAgents } from '../orchestrator/pickAgents.js';
 import { runDebate } from '../orchestrator/runDebate.js';
 import { judgeDebate } from '../judge/judgeDebate.js';
 import { applyEloChange } from '../elo/applyEloChange.js';
+import { applyHumanVote } from '../elo/applyHumanVote.js';
 
 const router = Router();
 
@@ -175,6 +176,9 @@ router.get('/:id', async (req, res, next) => {
             },
             reasoning: debate.evaluation.reasoning,
             judgeModel: debate.evaluation.judgeModel,
+            humanWinner: debate.evaluation.humanWinner,
+            humanVotedAt: debate.evaluation.humanVotedAt?.toISOString() ?? null,
+            humanAgreedWithJudge: debate.evaluation.humanAgreedWithJudge,
             createdAt: debate.evaluation.createdAt.toISOString(),
           }
         : null,
@@ -244,6 +248,46 @@ router.post(
 
       res.status(201).json({ debateId: debate.id });
     } catch (err) {
+      next(err);
+    }
+  },
+);
+
+// ============================================================================
+// POST /api/debates/:id/vote — human override (or confirmation) of judge verdict
+// ============================================================================
+
+router.post(
+  '/:id/vote',
+  requireKeyphrase,
+  rateLimit({ max: 50, windowMs: 24 * 60 * 60 * 1000 }),
+  async (req, res, next) => {
+    try {
+      const { id } = req.params;
+      const winner = req.body?.winner;
+
+      if (!['aff', 'neg', 'draw'].includes(winner)) {
+        return res.status(400).json({
+          error: "winner must be 'aff', 'neg', or 'draw'",
+        });
+      }
+
+      const result = await applyHumanVote(id, winner);
+
+      res.json(result);
+    } catch (err) {
+      const msg = err?.message ?? '';
+
+      if (msg.includes('not found')) {
+        return res.status(404).json({ error: msg });
+      }
+      if (msg.includes('already has a human vote')) {
+        return res.status(409).json({ error: msg });
+      }
+      if (msg.includes('no evaluation') || msg.includes('status') || msg.includes("must be 'aff'")) {
+        return res.status(400).json({ error: msg });
+      }
+
       next(err);
     }
   },
@@ -513,6 +557,9 @@ function replayCompletedDebate(send, debate) {
           },
           reasoning: debate.evaluation.reasoning,
           judgeModel: debate.evaluation.judgeModel,
+          humanWinner: debate.evaluation.humanWinner,
+          humanVotedAt: debate.evaluation.humanVotedAt?.toISOString() ?? null,
+          humanAgreedWithJudge: debate.evaluation.humanAgreedWithJudge,
         }
       : null,
     eloChanges: (debate.eloChanges || []).map((c) => ({
