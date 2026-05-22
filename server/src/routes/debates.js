@@ -19,6 +19,7 @@ import { rateLimit } from '../middleware/rateLimit.js';
 import { prisma } from '../db.js';
 import { pickRandomAgents } from '../orchestrator/pickAgents.js';
 import { runDebate } from '../orchestrator/runDebate.js';
+import { judgeDebate } from '../judge/judgeDebate.js';
 
 const router = Router();
 
@@ -360,20 +361,54 @@ router.get('/:id/stream', async (req, res) => {
     });
 
     // ------------------------------------------------------------------------
-    // After orchestrator: judge + ELO + final debate_complete reveal.
-    // (Added in Prompts 13 and 14. For Prompt 12, we end here with a minimal
-    // debate_complete that just reveals identities.)
+    // After orchestrator: judge evaluates, then ELO updates (Prompt 14), then
+    // we emit the final debate_complete reveal.
     // ------------------------------------------------------------------------
     if (orchestratorDone) {
-      // Refetch agent info — orchestrator didn't return them, but we have them above.
+      let evaluationResult = null;
+      try {
+        evaluationResult = await judgeDebate({
+          debateId: id,
+          signal: abortController.signal,
+          onEvent: (event) => send(event.type, event),
+        });
+      } catch (err) {
+        if (err.name === 'AbortError' || abortController.signal.aborted) throw err;
+        // Judge already marked the debate failed; just surface the error.
+        send('error', { message: `Judge failed: ${err.message ?? 'unknown'}` });
+        return finish();
+      }
+
+      const evaluation = evaluationResult?.evaluation;
+
       send('debate_complete', {
         debateId: id,
         topic: debate.topic,
         affAgent: debate.affAgent,
         negAgent: debate.negAgent,
-        winner: null,        // populated in Prompt 13 (judge)
-        evaluation: null,    // populated in Prompt 13
-        eloChanges: [],      // populated in Prompt 14
+        winner: evaluation?.winner ?? null,
+        evaluation: evaluation
+          ? {
+              winner: evaluation.winner,
+              affScores: {
+                argument: evaluation.affArgument,
+                evidence: evaluation.affEvidence,
+                responsive: evaluation.affResponsive,
+                persuasion: evaluation.affPersuasion,
+                total: evaluation.affTotal,
+              },
+              negScores: {
+                argument: evaluation.negArgument,
+                evidence: evaluation.negEvidence,
+                responsive: evaluation.negResponsive,
+                persuasion: evaluation.negPersuasion,
+                total: evaluation.negTotal,
+              },
+              reasoning: evaluation.reasoning,
+              judgeModel: evaluation.judgeModel,
+            }
+          : null,
+        eloChanges: [], // populated in Prompt 14
       });
     }
 
