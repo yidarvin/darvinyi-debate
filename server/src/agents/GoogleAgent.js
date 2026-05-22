@@ -1,16 +1,14 @@
 // Google Gemini adapter for the AgentRunner contract.
 //
 // Uses @google/genai SDK with Gemini 2.5 Pro. Exposes:
-//   - web_search: Google Search grounding (server-side, metadata-driven)
 //   - web_fetch:  function declaration wrapping webFetch()
 //
-// Grounding caveat: older Gemini versions disallowed mixing googleSearch with
-// function declarations. 2.0+ allows it. If the API rejects the combination,
-// we drop grounding and log a warning.
-//
-// Event ordering caveat: Gemini emits groundingMetadata at the END of the
-// stream, so synthetic web_search tool_call_start/end events fire AFTER the
-// text they support. The frontend handles non-strict ordering.
+// Grounding (googleSearch) is NOT exposed: Gemini 2.5 Pro rejects requests
+// that combine built-in tools (googleSearch) with function declarations
+// ("Built-in tools and Function Calling cannot be combined in the same
+// request"). We prefer function calling so web_fetch keeps working; web_search
+// becomes an advertised-but-unused tool from the model's perspective, which
+// is acceptable since the system prompt is calibrated for both.
 
 import { GoogleGenAI } from '@google/genai';
 import { AgentRunner } from './AgentRunner.js';
@@ -22,9 +20,6 @@ export class GoogleAgent extends AgentRunner {
   constructor(config) {
     super(config);
     this.client = new GoogleGenAI({ apiKey: this.apiKey });
-
-    // Tracks whether we've fallen back to no-grounding mode after a rejection.
-    this._groundingDisabled = false;
   }
 
   async *runTurn({ systemPrompt, conversation, signal, maxIterations = 8 }) {
@@ -41,12 +36,8 @@ export class GoogleAgent extends AgentRunner {
       parts: [{ text: m.content }],
     }));
 
-    const buildTools = () => {
-      const tools = [];
-      if (!this._groundingDisabled) {
-        tools.push({ googleSearch: {} });
-      }
-      tools.push({
+    const tools = [
+      {
         functionDeclarations: [
           {
             name: WEB_FETCH_TOOL_SCHEMA.name,
@@ -54,12 +45,8 @@ export class GoogleAgent extends AgentRunner {
             parameters: WEB_FETCH_TOOL_SCHEMA.input_schema,
           },
         ],
-      });
-      return tools;
-    };
-
-    // Track search queries already announced so we don't double-emit.
-    const announcedSearchQueries = new Set();
+      },
+    ];
 
     let iteration = 0;
     while (iteration < maxIterations) {
@@ -68,38 +55,19 @@ export class GoogleAgent extends AgentRunner {
 
       const config = {
         systemInstruction: systemPrompt,
-        tools: buildTools(),
+        tools,
         maxOutputTokens: MAX_OUTPUT_TOKENS,
       };
 
-      let stream;
-      try {
-        stream = await this.client.models.generateContentStream({
-          model: this.modelId,
-          contents,
-          config,
-        });
-      } catch (err) {
-        const message = (err.message || '').toLowerCase();
-        if (
-          !this._groundingDisabled &&
-          (message.includes('tools') || message.includes('grounding') || message.includes('search')) &&
-          (message.includes('combine') || message.includes('not supported') || message.includes('cannot'))
-        ) {
-          console.warn(
-            `[google-agent] API rejected combined grounding+function tools (${err.message}). Disabling grounding and retrying.`,
-          );
-          this._groundingDisabled = true;
-          iteration--; // retry this iteration with the new tool config
-          continue;
-        }
-        throw err;
-      }
+      const stream = await this.client.models.generateContentStream({
+        model: this.modelId,
+        contents,
+        config,
+      });
 
       // Per-iteration accumulators.
       const functionCalls = []; // { name, args }
       const modelParts = []; // accumulated parts for the model turn (added back to contents on tool calls)
-      let groundingMetadata = null;
 
       try {
         for await (const chunk of stream) {
@@ -126,11 +94,6 @@ export class GoogleAgent extends AgentRunner {
             }
           }
 
-          // Grounding metadata (usually arrives near end of stream).
-          if (candidate?.groundingMetadata) {
-            groundingMetadata = candidate.groundingMetadata;
-          }
-
           // Token counting.
           if (chunk.usageMetadata) {
             totalTokensIn = chunk.usageMetadata.promptTokenCount ?? totalTokensIn;
@@ -140,30 +103,6 @@ export class GoogleAgent extends AgentRunner {
       } catch (err) {
         if (err.name === 'AbortError' || signal?.aborted) throw err;
         throw new Error(`GoogleAgent stream failed: ${err.message ?? err}`);
-      }
-
-      // Synthesize search tool_call events from grounding metadata.
-      if (groundingMetadata?.webSearchQueries) {
-        const sourceCount = Array.isArray(groundingMetadata.groundingChunks)
-          ? groundingMetadata.groundingChunks.length
-          : 0;
-        for (const query of groundingMetadata.webSearchQueries) {
-          if (announcedSearchQueries.has(query)) continue;
-          announcedSearchQueries.add(query);
-
-          yield { type: 'tool_call_start', tool: 'web_search', input: { query } };
-          yield {
-            type: 'tool_call_end',
-            tool: 'web_search',
-            outputSummary: `${sourceCount} source${sourceCount === 1 ? '' : 's'} grounded`,
-          };
-
-          allToolCalls.push({
-            tool: 'web_search',
-            input: { query },
-            outputSummary: `${sourceCount} sources grounded`,
-          });
-        }
       }
 
       // If no function calls remain, we're done with this turn.

@@ -4,10 +4,14 @@
 // pointed at xAI's endpoint. Chat Completions only (no Responses API at xAI).
 //
 // Tools exposed:
-//   - web_search: xAI Live Search via `search_parameters` in the request body.
-//                 Citations are returned out-of-band and synthesized into a
-//                 single web_search tool_call_start/end pair per turn.
 //   - web_fetch:  standard OpenAI function tool wrapping webFetch().
+//
+// web_search is NOT exposed: xAI deprecated the OpenAI-compatible Live Search
+// `search_parameters` field (HTTP 410 "Live search is deprecated. Please switch
+// to the Agent Tools API"). Their replacement Agent Tools API is not OpenAI
+// compatible — migrating would require a separate SDK and request shape, so
+// Grok runs with web_fetch only. The system prompt advertises web_search to
+// all debaters; Grok simply has no API mechanism to invoke it.
 
 import OpenAI from 'openai';
 import { AgentRunner } from './AgentRunner.js';
@@ -15,12 +19,6 @@ import { webFetch, summarizeWebFetchResult, WEB_FETCH_TOOL_SCHEMA } from '../too
 
 const XAI_BASE_URL = 'https://api.x.ai/v1';
 const MAX_OUTPUT_TOKENS = 4096;
-
-// Live Search configuration. `mode: 'auto'` lets Grok decide whether to search.
-const LIVE_SEARCH_PARAMETERS = {
-  mode: 'auto',
-  return_citations: true,
-};
 
 export class XaiAgent extends AgentRunner {
   constructor(config) {
@@ -37,10 +35,6 @@ export class XaiAgent extends AgentRunner {
     const allToolCalls = [];
     let totalTokensIn = 0;
     let totalTokensOut = 0;
-
-    // Track whether we've already synthesized a web_search event so we don't
-    // double-emit if multiple iterations each produce citations.
-    let webSearchAnnounced = false;
 
     // Convert conversation to Chat Completions messages with system prompt at the front.
     const messages = [{ role: 'system', content: systemPrompt }, ...conversation];
@@ -69,42 +63,13 @@ export class XaiAgent extends AgentRunner {
         stream: true,
         max_tokens: MAX_OUTPUT_TOKENS,
         stream_options: { include_usage: true },
-        // xAI extension. The OpenAI SDK passes through unknown fields.
-        search_parameters: LIVE_SEARCH_PARAMETERS,
       };
 
-      let stream;
-      try {
-        stream = await this.client.chat.completions.create(params, { signal });
-      } catch (err) {
-        // If search_parameters is rejected (unknown field on older endpoints, or
-        // 410 "Live search deprecated" on newer ones), retry without it. xAI has
-        // since migrated to a separate Agent Tools API that isn't OpenAI-compatible,
-        // so Grok runs without native search in that case — web_fetch still works.
-        const message = (err.message || '').toLowerCase();
-        const isSearchParamsRejection =
-          err.status === 410 ||
-          message.includes('search_parameters') ||
-          message.includes('live search') ||
-          message.includes('deprecated') ||
-          message.includes('agent tools') ||
-          message.includes('unknown') ||
-          message.includes('unrecognized');
-        if (isSearchParamsRejection) {
-          console.warn(
-            `[xai-agent] search_parameters rejected by API (${err.message}). Retrying without Live Search.`,
-          );
-          delete params.search_parameters;
-          stream = await this.client.chat.completions.create(params, { signal });
-        } else {
-          throw err;
-        }
-      }
+      const stream = await this.client.chat.completions.create(params, { signal });
 
       // Per-iteration accumulators.
       const pendingToolCalls = new Map(); // index -> { id, name, argsJson }
       let finishReason = null;
-      let citations = []; // accumulated; last non-empty wins
 
       try {
         for await (const chunk of stream) {
@@ -143,36 +108,10 @@ export class XaiAgent extends AgentRunner {
             totalTokensIn = chunk.usage.prompt_tokens ?? totalTokensIn;
             totalTokensOut += chunk.usage.completion_tokens ?? 0;
           }
-
-          // Citations: xAI surfaces them on chunks. Check multiple possible locations.
-          const chunkCitations =
-            chunk.citations ||
-            choice?.delta?.citations ||
-            choice?.citations ||
-            null;
-          if (Array.isArray(chunkCitations) && chunkCitations.length > 0) {
-            citations = chunkCitations;
-          }
         }
       } catch (err) {
         if (err.name === 'AbortError' || signal?.aborted) throw err;
         throw new Error(`XaiAgent stream failed: ${err.message ?? err}`);
-      }
-
-      // Synthesize a single web_search tool_call pair if citations were returned.
-      if (citations.length > 0 && !webSearchAnnounced) {
-        webSearchAnnounced = true;
-        yield { type: 'tool_call_start', tool: 'web_search', input: {} };
-        yield {
-          type: 'tool_call_end',
-          tool: 'web_search',
-          outputSummary: `${citations.length} citation${citations.length === 1 ? '' : 's'} from Live Search`,
-        };
-        allToolCalls.push({
-          tool: 'web_search',
-          input: {},
-          outputSummary: `${citations.length} citations from Live Search`,
-        });
       }
 
       // If no function calls or finish_reason indicates done, exit loop.
