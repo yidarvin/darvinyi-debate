@@ -8,6 +8,11 @@
 //
 // All IDs are strings. Agent IDs are stable human-readable slugs (e.g. "claude-opus-4-7").
 // All other IDs are cuids.
+//
+// Matches are two-sided: each match consists of two legs. In leg 1, agent A
+// takes affirmative and agent B takes negative. In leg 2, they swap. Each leg
+// is judged independently; the match winner is computed by summing the judge's
+// per-leg scores across both legs.
 
 generator client {
   provider = "prisma-client-js"
@@ -38,37 +43,36 @@ model Agent {
   draws       Int      @default(0)
   createdAt   DateTime @default(now())
 
-  affDebates Debate[]    @relation("Affirmative")
-  negDebates Debate[]    @relation("Negative")
+  aDebates   Debate[]    @relation("A")
+  bDebates   Debate[]    @relation("B")
   eloChanges EloChange[]
 }
 
 // ============================================================================
 // Debate
 // ----------------------------------------------------------------------------
-// One debate session. Two agents, one topic, six turns.
-// status: 'pending' → 'in_progress' → 'completed' (or 'failed' on error)
-// winner is null until the judge finishes; then 'aff', 'neg', or 'draw'.
-// errorMessage is populated only for failed debates (e.g. judge JSON parse
-// failure after retry).
+// One match. Two agents, one topic, two legs of six turns each.
+// status: 'pending' → 'in_progress' → 'judging' → 'completed' (or 'failed').
+// winner is null until both legs are judged + scores summed; then 'A', 'B',
+// or 'draw' — the agent-level match outcome (not a position).
 // ============================================================================
 
 model Debate {
   id           String    @id @default(cuid())
   topic        String
   status       String    @default("pending")
-  affAgentId   String
-  negAgentId   String
-  affAgent     Agent     @relation("Affirmative", fields: [affAgentId], references: [id])
-  negAgent     Agent     @relation("Negative", fields: [negAgentId], references: [id])
+  agentAId     String
+  agentBId     String
+  agentA       Agent     @relation("A", fields: [agentAId], references: [id])
+  agentB       Agent     @relation("B", fields: [agentBId], references: [id])
   winner       String?
   errorMessage String?
   createdAt    DateTime  @default(now())
   completedAt  DateTime?
 
-  turns      DebateTurn[]
-  evaluation Evaluation?
-  eloChanges EloChange[]
+  turns       DebateTurn[]
+  evaluations Evaluation[]
+  eloChanges  EloChange[]
 
   @@index([createdAt])
   @@index([status])
@@ -78,17 +82,16 @@ model Debate {
 // ============================================================================
 // DebateTurn
 // ----------------------------------------------------------------------------
-// One round of a debate. Always 6 turns per completed debate, ordered by
-// roundNumber 1..6.
-// toolCalls is a JSON array of { tool, input, outputSummary } objects, captured
-// from the AgentRunner event stream.
-// content is the final accumulated text of the turn — what the judge sees.
+// One round of one leg. Always 12 turns per completed debate: 6 per leg.
+// leg ∈ {1, 2}. roundNumber ∈ {1..6}.
+// side is the POSITION taken in this leg ('aff' or 'neg') — not an agent id.
 // ============================================================================
 
 model DebateTurn {
   id          String   @id @default(cuid())
   debateId    String
   debate      Debate   @relation(fields: [debateId], references: [id], onDelete: Cascade)
+  leg         Int
   roundNumber Int
   roundName   String
   side        String
@@ -99,23 +102,24 @@ model DebateTurn {
   durationMs  Int?
   createdAt   DateTime @default(now())
 
-  @@index([debateId, roundNumber])
+  @@unique([debateId, leg, roundNumber])
+  @@index([debateId, leg, roundNumber])
 }
 
 // ============================================================================
 // Evaluation
 // ----------------------------------------------------------------------------
-// The judge's verdict. One per completed debate (unique on debateId).
-// Scores are stored individually so the UI can render per-axis bars and so
-// future analyses can dig into specific dimensions.
-// Totals (affTotal, negTotal) are computed by the judge module and stored
-// for convenience.
+// The judge's verdict for ONE leg. Two rows per completed debate (one per leg).
+// winner is the per-leg position winner ('aff' | 'neg' | 'draw') — anonymized.
+// The agent-level match outcome lives on Debate.winner and is computed by
+// summing affTotal + negTotal across both legs.
 // ============================================================================
 
 model Evaluation {
   id            String   @id @default(cuid())
-  debateId      String   @unique
+  debateId      String
   debate        Debate   @relation(fields: [debateId], references: [id], onDelete: Cascade)
+  leg           Int
   winner        String
   affArgument   Float
   affEvidence   Float
@@ -130,18 +134,20 @@ model Evaluation {
   reasoning     String   @db.Text
   judgeModel    String
 
-  // Human vote (optional override of the judge's verdict)
+  // Human vote (agreement-tracking only — does not affect match outcome or ELO).
   humanWinner          String?
   humanVotedAt         DateTime?
   humanAgreedWithJudge Boolean?
 
-  createdAt     DateTime @default(now())
+  createdAt DateTime @default(now())
+
+  @@unique([debateId, leg])
 }
 
 // ============================================================================
 // EloChange
 // ----------------------------------------------------------------------------
-// One row per agent per debate. Captures the before/after/delta so an agent's
+// One row per agent per match. Captures before/after/delta so an agent's
 // ELO trajectory can be rendered as a line chart on the profile page.
 // ============================================================================
 

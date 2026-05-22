@@ -1,17 +1,18 @@
 // /api/debates — read endpoints + create + stream
 //
 // Endpoints:
-//   GET  /                — paginated list (from Prompt 5)
-//   GET  /:id             — full debate detail (from Prompt 5)
+//   GET  /                — paginated list
+//   GET  /:id             — full debate detail (two legs, two evaluations)
 //   POST /                — create a new debate (keyphrase + rate limit gated)
+//   POST /:id/vote        — record per-leg human vote (agreement only)
 //   GET  /:id/stream      — Server-Sent Events stream of debate events
 //
 // Stream semantics by debate status:
-//   pending      → run the orchestrator, push events live, end on all_rounds_complete
-//   in_progress  → replay saved turns, then emit an info `error` event explaining
-//                  that the debate is running in another session, close
-//   completed    → replay all saved state (turns + reveal) instantly, close
-//   failed       → replay saved turns, emit error event, close
+//   pending      → run the orchestrator (two legs), then judge each leg, then ELO, close
+//   in_progress  → replay saved turns, advise client, close
+//   judging      → replay saved turns + any saved evaluations, advise client, close
+//   completed    → replay all saved state instantly, close
+//   failed       → replay saved turns + evaluations + error, close
 
 import { Router } from 'express';
 import { requireKeyphrase } from '../middleware/auth.js';
@@ -19,22 +20,70 @@ import { rateLimit } from '../middleware/rateLimit.js';
 import { prisma } from '../db.js';
 import { pickRandomAgents } from '../orchestrator/pickAgents.js';
 import { runDebate } from '../orchestrator/runDebate.js';
-import { judgeDebate } from '../judge/judgeDebate.js';
+import { judgeLeg } from '../judge/judgeDebate.js';
 import { applyEloChange } from '../elo/applyEloChange.js';
-import { applyHumanVote } from '../elo/applyHumanVote.js';
+import { recordHumanVote } from '../elo/applyHumanVote.js';
+import { computeMatchOutcome } from '../match/computeMatchOutcome.js';
 
 const router = Router();
 
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
-const VALID_STATUSES = ['pending', 'in_progress', 'completed', 'failed'];
+const VALID_STATUSES = ['pending', 'in_progress', 'judging', 'completed', 'failed'];
 
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const MIN_TOPIC_LENGTH = 5;
 const MAX_TOPIC_LENGTH = 500;
 
 // ============================================================================
-// GET /api/debates — list (from Prompt 5, unchanged)
+// Serialization helpers
+// ============================================================================
+
+function serializeEvaluation(evaluation) {
+  if (!evaluation) return null;
+  return {
+    leg: evaluation.leg,
+    winner: evaluation.winner,
+    affScores: {
+      argument: evaluation.affArgument,
+      evidence: evaluation.affEvidence,
+      responsive: evaluation.affResponsive,
+      persuasion: evaluation.affPersuasion,
+      total: evaluation.affTotal,
+    },
+    negScores: {
+      argument: evaluation.negArgument,
+      evidence: evaluation.negEvidence,
+      responsive: evaluation.negResponsive,
+      persuasion: evaluation.negPersuasion,
+      total: evaluation.negTotal,
+    },
+    reasoning: evaluation.reasoning,
+    judgeModel: evaluation.judgeModel,
+    humanWinner: evaluation.humanWinner,
+    humanVotedAt: evaluation.humanVotedAt ? evaluation.humanVotedAt.toISOString() : null,
+    humanAgreedWithJudge: evaluation.humanAgreedWithJudge,
+    createdAt: evaluation.createdAt ? evaluation.createdAt.toISOString() : null,
+  };
+}
+
+function serializeTurn(t) {
+  return {
+    leg: t.leg,
+    roundNumber: t.roundNumber,
+    roundName: t.roundName,
+    side: t.side,
+    content: t.content,
+    toolCalls: t.toolCalls ?? [],
+    tokensIn: t.tokensIn ?? 0,
+    tokensOut: t.tokensOut ?? 0,
+    durationMs: t.durationMs ?? 0,
+    createdAt: t.createdAt ? t.createdAt.toISOString() : null,
+  };
+}
+
+// ============================================================================
+// GET /api/debates — list
 // ============================================================================
 
 router.get('/', async (req, res, next) => {
@@ -79,8 +128,8 @@ router.get('/', async (req, res, next) => {
     const debates = await prisma.debate.findMany({
       where,
       include: {
-        affAgent: { select: { id: true, displayName: true } },
-        negAgent: { select: { id: true, displayName: true } },
+        agentA: { select: { id: true, displayName: true } },
+        agentB: { select: { id: true, displayName: true } },
       },
       orderBy: [{ completedAt: 'desc' }, { createdAt: 'desc' }],
       take: limit,
@@ -100,8 +149,8 @@ router.get('/', async (req, res, next) => {
         topic: d.topic,
         status: d.status,
         winner: d.winner,
-        affAgent: d.affAgent,
-        negAgent: d.negAgent,
+        agentA: d.agentA,
+        agentB: d.agentB,
         createdAt: d.createdAt.toISOString(),
         completedAt: d.completedAt ? d.completedAt.toISOString() : null,
       })),
@@ -113,7 +162,7 @@ router.get('/', async (req, res, next) => {
 });
 
 // ============================================================================
-// GET /api/debates/:id — detail (from Prompt 5, unchanged)
+// GET /api/debates/:id — detail
 // ============================================================================
 
 router.get('/:id', async (req, res, next) => {
@@ -123,10 +172,10 @@ router.get('/:id', async (req, res, next) => {
     const debate = await prisma.debate.findUnique({
       where: { id },
       include: {
-        affAgent: { select: { id: true, displayName: true, provider: true, modelId: true } },
-        negAgent: { select: { id: true, displayName: true, provider: true, modelId: true } },
-        turns: { orderBy: { roundNumber: 'asc' } },
-        evaluation: true,
+        agentA: { select: { id: true, displayName: true, provider: true, modelId: true } },
+        agentB: { select: { id: true, displayName: true, provider: true, modelId: true } },
+        turns: { orderBy: [{ leg: 'asc' }, { roundNumber: 'asc' }] },
+        evaluations: { orderBy: { leg: 'asc' } },
         eloChanges: true,
       },
     });
@@ -134,6 +183,10 @@ router.get('/:id', async (req, res, next) => {
     if (!debate) {
       return res.status(404).json({ error: 'Debate not found' });
     }
+
+    const [eval1, eval2] = debate.evaluations;
+    const matchOutcome =
+      eval1 && eval2 ? computeMatchOutcome({ eval1, eval2 }) : null;
 
     res.json({
       debate: {
@@ -143,45 +196,12 @@ router.get('/:id', async (req, res, next) => {
         winner: debate.winner,
         createdAt: debate.createdAt.toISOString(),
         completedAt: debate.completedAt ? debate.completedAt.toISOString() : null,
-        affAgent: debate.affAgent,
-        negAgent: debate.negAgent,
+        agentA: debate.agentA,
+        agentB: debate.agentB,
       },
-      turns: debate.turns.map((t) => ({
-        roundNumber: t.roundNumber,
-        roundName: t.roundName,
-        side: t.side,
-        content: t.content,
-        toolCalls: t.toolCalls,
-        tokensIn: t.tokensIn,
-        tokensOut: t.tokensOut,
-        durationMs: t.durationMs,
-        createdAt: t.createdAt.toISOString(),
-      })),
-      evaluation: debate.evaluation
-        ? {
-            winner: debate.evaluation.winner,
-            affScores: {
-              argument: debate.evaluation.affArgument,
-              evidence: debate.evaluation.affEvidence,
-              responsive: debate.evaluation.affResponsive,
-              persuasion: debate.evaluation.affPersuasion,
-              total: debate.evaluation.affTotal,
-            },
-            negScores: {
-              argument: debate.evaluation.negArgument,
-              evidence: debate.evaluation.negEvidence,
-              responsive: debate.evaluation.negResponsive,
-              persuasion: debate.evaluation.negPersuasion,
-              total: debate.evaluation.negTotal,
-            },
-            reasoning: debate.evaluation.reasoning,
-            judgeModel: debate.evaluation.judgeModel,
-            humanWinner: debate.evaluation.humanWinner,
-            humanVotedAt: debate.evaluation.humanVotedAt?.toISOString() ?? null,
-            humanAgreedWithJudge: debate.evaluation.humanAgreedWithJudge,
-            createdAt: debate.evaluation.createdAt.toISOString(),
-          }
-        : null,
+      turns: debate.turns.map(serializeTurn),
+      evaluations: debate.evaluations.map(serializeEvaluation),
+      matchOutcome,
       eloChanges: debate.eloChanges.map((c) => ({
         agentId: c.agentId,
         before: c.before,
@@ -235,14 +255,14 @@ router.post(
         }
       }
 
-      const { affAgent, negAgent } = await pickRandomAgents();
+      const { agentA, agentB } = await pickRandomAgents();
 
       const debate = await prisma.debate.create({
         data: {
           topic,
           status: 'pending',
-          affAgentId: affAgent.id,
-          negAgentId: negAgent.id,
+          agentAId: agentA.id,
+          agentBId: agentB.id,
         },
       });
 
@@ -254,7 +274,7 @@ router.post(
 );
 
 // ============================================================================
-// POST /api/debates/:id/vote — human override (or confirmation) of judge verdict
+// POST /api/debates/:id/vote — per-leg human agreement vote
 // ============================================================================
 
 router.post(
@@ -264,27 +284,31 @@ router.post(
   async (req, res, next) => {
     try {
       const { id } = req.params;
-      const winner = req.body?.winner;
+      const { leg, winner } = req.body ?? {};
 
+      if (leg !== 1 && leg !== 2) {
+        return res.status(400).json({ error: 'leg must be 1 or 2' });
+      }
       if (!['aff', 'neg', 'draw'].includes(winner)) {
-        return res.status(400).json({
-          error: "winner must be 'aff', 'neg', or 'draw'",
-        });
+        return res.status(400).json({ error: "winner must be 'aff', 'neg', or 'draw'" });
       }
 
-      const result = await applyHumanVote(id, winner);
-
+      const result = await recordHumanVote(id, leg, winner);
       res.json(result);
     } catch (err) {
       const msg = err?.message ?? '';
 
-      if (msg.includes('not found')) {
+      if (msg.includes('No evaluation found')) {
         return res.status(404).json({ error: msg });
       }
-      if (msg.includes('already has a human vote')) {
+      if (msg.includes('already has a human vote') || msg.includes('already recorded')) {
         return res.status(409).json({ error: msg });
       }
-      if (msg.includes('no evaluation') || msg.includes('status') || msg.includes("must be 'aff'")) {
+      if (
+        msg.includes('leg must be') ||
+        msg.includes("must be 'aff'") ||
+        msg.includes('humanWinner must be')
+      ) {
         return res.status(400).json({ error: msg });
       }
 
@@ -304,10 +328,10 @@ router.get('/:id/stream', async (req, res) => {
   const debate = await prisma.debate.findUnique({
     where: { id },
     include: {
-      affAgent: { select: { id: true, displayName: true, provider: true, modelId: true } },
-      negAgent: { select: { id: true, displayName: true, provider: true, modelId: true } },
-      turns: { orderBy: { roundNumber: 'asc' } },
-      evaluation: true,
+      agentA: { select: { id: true, displayName: true, provider: true, modelId: true } },
+      agentB: { select: { id: true, displayName: true, provider: true, modelId: true } },
+      turns: { orderBy: [{ leg: 'asc' }, { roundNumber: 'asc' }] },
+      evaluations: { orderBy: { leg: 'asc' } },
       eloChanges: true,
     },
   });
@@ -320,7 +344,7 @@ router.get('/:id/stream', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no'); // disable nginx/proxy buffering
+  res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
   const send = (eventType, payload) => {
@@ -329,14 +353,12 @@ router.get('/:id/stream', async (req, res) => {
     res.write(`data: ${JSON.stringify(payload ?? {})}\n\n`);
   };
 
-  // Heartbeat every 15s so proxies don't close idle connections.
   const heartbeat = setInterval(() => {
     if (res.writableEnded || res.destroyed) return;
     res.write(`: heartbeat ${Date.now()}\n\n`);
   }, HEARTBEAT_INTERVAL_MS);
   heartbeat.unref?.();
 
-  // Abort the orchestrator if the client disconnects.
   const abortController = new AbortController();
   req.on('close', () => {
     clearInterval(heartbeat);
@@ -351,17 +373,11 @@ router.get('/:id/stream', async (req, res) => {
   };
 
   try {
-    // ------------------------------------------------------------------------
-    // status: completed — replay everything instantly, then close.
-    // ------------------------------------------------------------------------
     if (debate.status === 'completed') {
       replayCompletedDebate(send, debate);
       return finish();
     }
 
-    // ------------------------------------------------------------------------
-    // status: failed — replay turns + error, then close.
-    // ------------------------------------------------------------------------
     if (debate.status === 'failed') {
       replayPartialDebate(send, debate);
       send('error', {
@@ -372,129 +388,104 @@ router.get('/:id/stream', async (req, res) => {
       return finish();
     }
 
-    // ------------------------------------------------------------------------
-    // status: in_progress — replay saved turns, advise client, close.
-    // (v1 does not support attaching mid-stream to a running debate.)
-    // ------------------------------------------------------------------------
-    if (debate.status === 'in_progress') {
+    if (debate.status === 'in_progress' || debate.status === 'judging') {
       replayPartialDebate(send, debate);
       send('error', {
         message:
-          'Debate is currently in progress in another session. Refresh in a moment to load the final result.',
+          'Debate is currently running in another session. Refresh in a moment to load the final result.',
       });
       return finish();
     }
 
     // ------------------------------------------------------------------------
-    // status: pending — run the orchestrator and stream live.
+    // status: pending — run orchestrator (two legs), then judge each leg, then ELO.
     // ------------------------------------------------------------------------
 
-    // Track which round_complete events fired so the final reveal can include them.
-    // (Used by Prompts 13 and 14 when they extend this handler with judge + ELO.)
     let orchestratorDone = false;
 
     await runDebate({
       debateId: id,
       signal: abortController.signal,
       onEvent: (event) => {
-        // Forward every orchestrator event to the SSE client by its type.
         send(event.type, event);
-        if (event.type === 'all_rounds_complete') {
+        if (event.type === 'all_legs_complete') {
           orchestratorDone = true;
         }
       },
     });
 
-    // ------------------------------------------------------------------------
-    // After orchestrator: judge evaluates, then ELO updates (Prompt 14), then
-    // we emit the final debate_complete reveal.
-    // ------------------------------------------------------------------------
-    if (orchestratorDone) {
-      let evaluationResult = null;
-      try {
-        evaluationResult = await judgeDebate({
-          debateId: id,
-          signal: abortController.signal,
-          onEvent: (event) => send(event.type, event),
-        });
-      } catch (err) {
-        if (err.name === 'AbortError' || abortController.signal.aborted) throw err;
-        // Judge already marked the debate failed; just surface the error.
-        send('error', { message: `Judge failed: ${err.message ?? 'unknown'}` });
-        return finish();
-      }
+    if (!orchestratorDone) {
+      // Orchestrator returned without emitting all_legs_complete — shouldn't happen, but bail out cleanly.
+      return finish();
+    }
 
-      const evaluation = evaluationResult?.evaluation;
+    // Transition to 'judging' before invoking the judge.
+    await prisma.debate.update({
+      where: { id },
+      data: { status: 'judging' },
+    });
 
-      // Apply ELO. Non-fatal on failure — the judge succeeded and the
-      // verdict stands; the ratings can be backfilled by running
-      // applyEloChange(debateId) manually if needed.
-      let eloResult = null;
-      if (evaluation) {
-        try {
-          eloResult = await applyEloChange(id);
-        } catch (err) {
-          console.error('[stream] applyEloChange failed for', id, ':', err);
-          send('error', { message: `ELO update failed: ${err.message ?? 'unknown'} (verdict stands; leaderboard may be temporarily out of sync)` });
-        }
-      }
-
-      const eloChangesPayload = eloResult
-        ? [
-            {
-              agentId: eloResult.aff.agentId,
-              before: eloResult.aff.before,
-              after: eloResult.aff.after,
-              delta: eloResult.aff.delta,
-            },
-            {
-              agentId: eloResult.neg.agentId,
-              before: eloResult.neg.before,
-              after: eloResult.neg.after,
-              delta: eloResult.neg.delta,
-            },
-          ]
-        : [];
-
-      if (eloResult) {
-        send('elo_updated', { changes: eloChangesPayload });
-      }
-
-      send('debate_complete', {
+    try {
+      await judgeLeg({
         debateId: id,
-        topic: debate.topic,
-        affAgent: debate.affAgent,
-        negAgent: debate.negAgent,
-        winner: evaluation?.winner ?? null,
-        evaluation: evaluation
-          ? {
-              winner: evaluation.winner,
-              affScores: {
-                argument: evaluation.affArgument,
-                evidence: evaluation.affEvidence,
-                responsive: evaluation.affResponsive,
-                persuasion: evaluation.affPersuasion,
-                total: evaluation.affTotal,
-              },
-              negScores: {
-                argument: evaluation.negArgument,
-                evidence: evaluation.negEvidence,
-                responsive: evaluation.negResponsive,
-                persuasion: evaluation.negPersuasion,
-                total: evaluation.negTotal,
-              },
-              reasoning: evaluation.reasoning,
-              judgeModel: evaluation.judgeModel,
-            }
-          : null,
-        eloChanges: eloChangesPayload,
+        leg: 1,
+        signal: abortController.signal,
+        onEvent: (event) => send(event.type, event),
+      });
+      await judgeLeg({
+        debateId: id,
+        leg: 2,
+        signal: abortController.signal,
+        onEvent: (event) => send(event.type, event),
+      });
+    } catch (err) {
+      if (err.name === 'AbortError' || abortController.signal.aborted) throw err;
+      send('error', { message: `Judge failed: ${err.message}` });
+      return finish();
+    }
+
+    let eloResult = null;
+    try {
+      eloResult = await applyEloChange(id);
+    } catch (err) {
+      console.error('[stream] applyEloChange failed for', id, ':', err);
+      send('error', {
+        message: `ELO update failed: ${err.message} (verdicts stand; leaderboard may be temporarily out of sync)`,
       });
     }
 
+    if (eloResult) {
+      send('elo_updated', { changes: eloResult.eloChanges });
+    }
+
+    const finalDebate = await prisma.debate.findUnique({
+      where: { id },
+      include: {
+        agentA: true,
+        agentB: true,
+        evaluations: { orderBy: { leg: 'asc' } },
+        eloChanges: true,
+      },
+    });
+
+    send('debate_complete', {
+      debateId: id,
+      topic: finalDebate.topic,
+      agentA: finalDebate.agentA,
+      agentB: finalDebate.agentB,
+      winner: finalDebate.winner,
+      evaluations: finalDebate.evaluations.map(serializeEvaluation),
+      matchOutcome: eloResult?.outcome ?? null,
+      eloChanges: finalDebate.eloChanges.map((c) => ({
+        agentId: c.agentId,
+        before: c.before,
+        after: c.after,
+        delta: c.delta,
+      })),
+    });
+
     finish();
   } catch (err) {
-    // Orchestrator threw (or another step failed). The orchestrator marks the
-    // debate as failed itself; we just emit a stream error and close.
     if (!res.writableEnded) {
       const msg = err?.name === 'AbortError' ? 'Connection aborted' : `Stream error: ${err?.message ?? 'unknown'}`;
       send('error', { message: msg });
@@ -509,65 +500,90 @@ router.get('/:id/stream', async (req, res) => {
 
 function replayPartialDebate(send, debate) {
   send('debate_start', { debateId: debate.id, topic: debate.topic });
+
+  // Walk turns grouped by leg, emitting leg_start / round_complete / leg_complete.
+  const byLeg = new Map();
   for (const t of debate.turns) {
-    send('round_complete', {
-      type: 'round_complete',
-      round: t.roundNumber,
-      side: t.side,
-      content: t.content,
-      toolCalls: t.toolCalls ?? [],
-      tokensIn: t.tokensIn ?? 0,
-      tokensOut: t.tokensOut ?? 0,
-      durationMs: t.durationMs ?? 0,
-      resumed: true,
+    if (!byLeg.has(t.leg)) byLeg.set(t.leg, []);
+    byLeg.get(t.leg).push(t);
+  }
+
+  const legNumbers = [...byLeg.keys()].sort((a, b) => a - b);
+  for (const leg of legNumbers) {
+    send('leg_start', { leg });
+    const turns = byLeg.get(leg);
+    for (const t of turns) {
+      send('round_complete', {
+        leg: t.leg,
+        round: t.roundNumber,
+        side: t.side,
+        content: t.content,
+        toolCalls: t.toolCalls ?? [],
+        tokensIn: t.tokensIn ?? 0,
+        tokensOut: t.tokensOut ?? 0,
+        durationMs: t.durationMs ?? 0,
+        resumed: true,
+      });
+    }
+    // Only emit leg_complete if the leg has all 6 turns saved.
+    if (turns.length === 6) {
+      send('leg_complete', { leg });
+    }
+  }
+
+  // Replay any saved evaluations.
+  for (const evaluation of debate.evaluations) {
+    send('evaluation_complete', {
+      leg: evaluation.leg,
+      winner: evaluation.winner,
+      affScores: {
+        argument: evaluation.affArgument,
+        evidence: evaluation.affEvidence,
+        responsive: evaluation.affResponsive,
+        persuasion: evaluation.affPersuasion,
+        total: evaluation.affTotal,
+      },
+      negScores: {
+        argument: evaluation.negArgument,
+        evidence: evaluation.negEvidence,
+        responsive: evaluation.negResponsive,
+        persuasion: evaluation.negPersuasion,
+        total: evaluation.negTotal,
+      },
+      reasoning: evaluation.reasoning,
+      judgeModel: evaluation.judgeModel,
     });
   }
 }
 
 function replayCompletedDebate(send, debate) {
   replayPartialDebate(send, debate);
-  send('all_rounds_complete', {});
+  send('all_legs_complete', {});
 
-  // Evaluation + ELO are populated by Prompts 13 and 14 once those modules exist.
-  // For a Prompt-12-only build, debate.evaluation and debate.eloChanges may be
-  // empty. We still send debate_complete with whatever's available so the
-  // client can render the reveal.
+  const [eval1, eval2] = debate.evaluations;
+  const matchOutcome =
+    eval1 && eval2 ? computeMatchOutcome({ eval1, eval2 }) : null;
+
+  const eloChangesPayload = (debate.eloChanges || []).map((c) => ({
+    agentId: c.agentId,
+    before: c.before,
+    after: c.after,
+    delta: c.delta,
+  }));
+
+  if (eloChangesPayload.length > 0) {
+    send('elo_updated', { changes: eloChangesPayload });
+  }
+
   send('debate_complete', {
     debateId: debate.id,
     topic: debate.topic,
-    affAgent: debate.affAgent,
-    negAgent: debate.negAgent,
+    agentA: debate.agentA,
+    agentB: debate.agentB,
     winner: debate.winner,
-    evaluation: debate.evaluation
-      ? {
-          winner: debate.evaluation.winner,
-          affScores: {
-            argument: debate.evaluation.affArgument,
-            evidence: debate.evaluation.affEvidence,
-            responsive: debate.evaluation.affResponsive,
-            persuasion: debate.evaluation.affPersuasion,
-            total: debate.evaluation.affTotal,
-          },
-          negScores: {
-            argument: debate.evaluation.negArgument,
-            evidence: debate.evaluation.negEvidence,
-            responsive: debate.evaluation.negResponsive,
-            persuasion: debate.evaluation.negPersuasion,
-            total: debate.evaluation.negTotal,
-          },
-          reasoning: debate.evaluation.reasoning,
-          judgeModel: debate.evaluation.judgeModel,
-          humanWinner: debate.evaluation.humanWinner,
-          humanVotedAt: debate.evaluation.humanVotedAt?.toISOString() ?? null,
-          humanAgreedWithJudge: debate.evaluation.humanAgreedWithJudge,
-        }
-      : null,
-    eloChanges: (debate.eloChanges || []).map((c) => ({
-      agentId: c.agentId,
-      before: c.before,
-      after: c.after,
-      delta: c.delta,
-    })),
+    evaluations: debate.evaluations.map(serializeEvaluation),
+    matchOutcome,
+    eloChanges: eloChangesPayload,
   });
 }
 

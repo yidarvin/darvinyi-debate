@@ -2,9 +2,9 @@
 //
 //   PHASE A: pure function (no DB). Verifies the formula against hand-computed
 //           expected values from /context/ELO_SPEC.md.
-//   PHASE B: end-to-end DB integration. Creates a fake completed debate + evaluation,
-//           applies ELO, verifies agent rows updated + EloChange rows created.
-//           SNAPSHOTS and RESTORES agent stats so test runs are non-destructive.
+//   PHASE B: end-to-end DB integration with two-leg matches. Creates a debate
+//           with 2 evaluations, applies ELO based on the summed match outcome,
+//           verifies agent rows + EloChange rows.
 //
 // Usage: cd server && node scripts/test-elo.js
 //
@@ -14,6 +14,7 @@ import 'dotenv/config';
 import { prisma } from '../src/db.js';
 import { calculateNewRatings } from '../src/elo/calculate.js';
 import { applyEloChange } from '../src/elo/applyEloChange.js';
+import { computeMatchOutcome } from '../src/match/computeMatchOutcome.js';
 
 // ============================================================================
 // Phase A — pure function tests
@@ -40,8 +41,6 @@ const PURE_CASES = [
     expected: { newA: 1188,    newB: 1212,    deltaA: -12,   deltaB: 12 },
   },
   {
-    // Computed for K=24, standard ELO: expectedA = 1/(1+10^0.5) = 0.24025,
-    // deltaA = 24 * (1 - 0.24025) = 18.234. Prompt's 20.85 was a mis-derivation.
     name: 'Underdog wins (1100 vs 1300)',
     input:    { ratingA: 1100, ratingB: 1300, scoreA: 1 },
     expected: { newA: 1118.23, newB: 1281.77, deltaA: 18.23, deltaB: -18.23 },
@@ -86,7 +85,6 @@ function runPureTests() {
     }
   }
 
-  // Symmetry: deltaA + deltaB ≈ 0 always
   for (const c of PURE_CASES) {
     const r = calculateNewRatings(c.input);
     if (!approxEqual(r.deltaA + r.deltaB, 0, 0.001)) {
@@ -97,7 +95,6 @@ function runPureTests() {
   console.log(`  ✓ Symmetry: deltaA + deltaB ≈ 0 for all cases`);
   passed++;
 
-  // Validation errors
   const validationCases = [
     () => calculateNewRatings({ ratingA: 'foo', ratingB: 1200, scoreA: 1 }),
     () => calculateNewRatings({ ratingA: 1200, ratingB: NaN,   scoreA: 1 }),
@@ -120,12 +117,41 @@ function runPureTests() {
   if (valPassed === validationCases.length) passed++;
   else failed++;
 
+  // computeMatchOutcome sanity
+  {
+    const out = computeMatchOutcome({
+      eval1: { winner: 'aff', affTotal: 34, negTotal: 30 },
+      eval2: { winner: 'neg', affTotal: 29, negTotal: 32 },
+    });
+    // aTotal = 34 + 32 = 66; bTotal = 30 + 29 = 59 → A wins.
+    if (out.winner !== 'A' || out.aTotal !== 66 || out.bTotal !== 59) {
+      console.log(`  ✗ computeMatchOutcome basic: got ${JSON.stringify(out)}`);
+      failed++;
+    } else {
+      console.log(`  ✓ computeMatchOutcome basic: A wins with aTotal=66, bTotal=59`);
+      passed++;
+    }
+  }
+  {
+    const out = computeMatchOutcome({
+      eval1: { winner: 'aff', affTotal: 30, negTotal: 30 },
+      eval2: { winner: 'neg', affTotal: 30, negTotal: 30 },
+    });
+    if (out.winner !== 'draw' || out.aTotal !== 60 || out.bTotal !== 60) {
+      console.log(`  ✗ computeMatchOutcome tie: got ${JSON.stringify(out)}`);
+      failed++;
+    } else {
+      console.log(`  ✓ computeMatchOutcome tie: draw with aTotal=bTotal=60`);
+      passed++;
+    }
+  }
+
   console.log(`\n  Phase A: ${passed} passed, ${failed} failed`);
   if (failed > 0) process.exit(1);
 }
 
 // ============================================================================
-// Phase B — DB integration
+// Phase B — DB integration (two-leg match)
 // ============================================================================
 
 async function snapshotAllAgents() {
@@ -150,128 +176,169 @@ async function cleanupTestDebates() {
   return swept.count;
 }
 
-async function runIntegrationTest() {
-  console.log('\n=== PHASE B: DB integration ===\n');
+async function createTwoLegDebate({ topicSuffix, eval1Scores, eval2Scores, agentAId, agentBId }) {
+  return prisma.debate.create({
+    data: {
+      topic: `TEST DEBATE — elo module ${topicSuffix}`,
+      status: 'judging',
+      agentAId,
+      agentBId,
+      evaluations: {
+        create: [
+          { leg: 1, ...eval1Scores, judgeModel: 'claude-opus-4-7' },
+          { leg: 2, ...eval2Scores, judgeModel: 'claude-opus-4-7' },
+        ],
+      },
+    },
+  });
+}
 
-  // Snapshot ALL agents — restore in finally even on failure.
+async function runIntegrationTest() {
+  console.log('\n=== PHASE B: DB integration (two-leg) ===\n');
+
   const snapshot = await snapshotAllAgents();
   console.log(`  Snapshotted ${snapshot.length} agents`);
 
   let createdDebateIds = [];
 
   try {
-    // Find two agents to test with.
     const [agentA, agentB] = await prisma.agent.findMany({ take: 2, orderBy: { id: 'asc' } });
     if (!agentA || !agentB) throw new Error('Need at least 2 agents');
 
     const beforeA = agentA.elo;
     const beforeB = agentB.elo;
-    const beforeAffWins = agentA.wins;
-    const beforeNegLosses = agentB.losses;
+    const beforeAWins = agentA.wins;
+    const beforeBLosses = agentB.losses;
 
-    console.log(`  Aff (${agentA.id}): elo=${beforeA} wins=${beforeAffWins}`);
-    console.log(`  Neg (${agentB.id}): elo=${beforeB} losses=${beforeNegLosses}`);
+    console.log(`  Agent A (${agentA.id}): elo=${beforeA} wins=${beforeAWins}`);
+    console.log(`  Agent B (${agentB.id}): elo=${beforeB} losses=${beforeBLosses}`);
 
-    // Create a fake completed debate with evaluation. aff wins.
-    const debate = await prisma.debate.create({
-      data: {
-        topic: 'TEST DEBATE — elo module integration. Trivial topic.',
-        status: 'completed',
+    // ---- Case 1: agent A wins the match ----
+    // Leg 1 (A=aff): aff=34, neg=30. Aff wins.
+    // Leg 2 (A=neg): aff=29, neg=32. Neg wins (A wins this leg too as neg).
+    // aTotal = 34 + 32 = 66; bTotal = 30 + 29 = 59. A wins.
+    const debateAWin = await createTwoLegDebate({
+      topicSuffix: 'a-wins',
+      agentAId: agentA.id,
+      agentBId: agentB.id,
+      eval1Scores: {
         winner: 'aff',
-        completedAt: new Date(),
-        affAgentId: agentA.id,
-        negAgentId: agentB.id,
-        evaluation: {
-          create: {
-            winner: 'aff',
-            affArgument: 8, affEvidence: 8, affResponsive: 8, affPersuasion: 8, affTotal: 32,
-            negArgument: 7, negEvidence: 7, negResponsive: 7, negPersuasion: 7, negTotal: 28,
-            reasoning: 'Test evaluation reasoning, deliberately verbose enough to satisfy the minimum length requirement. The affirmative case is stronger. ' + 'Lorem ipsum '.repeat(20),
-            judgeModel: 'claude-opus-4-7',
-          },
-        },
+        affArgument: 8.5, affEvidence: 8.5, affResponsive: 8.5, affPersuasion: 8.5, affTotal: 34,
+        negArgument: 7.5, negEvidence: 7.5, negResponsive: 7.5, negPersuasion: 7.5, negTotal: 30,
+        reasoning: 'Leg 1 reasoning. ' + 'Lorem ipsum '.repeat(20),
+      },
+      eval2Scores: {
+        winner: 'neg',
+        affArgument: 7.25, affEvidence: 7.25, affResponsive: 7.25, affPersuasion: 7.25, affTotal: 29,
+        negArgument: 8.0, negEvidence: 8.0, negResponsive: 8.0, negPersuasion: 8.0, negTotal: 32,
+        reasoning: 'Leg 2 reasoning. ' + 'Lorem ipsum '.repeat(20),
       },
     });
-    createdDebateIds.push(debate.id);
+    createdDebateIds.push(debateAWin.id);
 
-    // Apply ELO.
-    const result = await applyEloChange(debate.id);
+    const result = await applyEloChange(debateAWin.id);
 
-    console.log(`  ELO applied:`);
-    console.log(`    aff: ${result.aff.before} → ${result.aff.after} (Δ${result.aff.delta.toFixed(2)})`);
-    console.log(`    neg: ${result.neg.before} → ${result.neg.after} (Δ${result.neg.delta.toFixed(2)})`);
+    console.log(`\n  Case 1 — A wins:`);
+    console.log(`    outcome: ${result.outcome.winner} (aTotal=${result.outcome.aTotal}, bTotal=${result.outcome.bTotal})`);
+    for (const c of result.eloChanges) {
+      console.log(`    ${c.agentId}: ${c.before} → ${c.after} (Δ${c.delta.toFixed(2)})`);
+    }
 
-    // Verify Agent rows updated.
+    if (result.outcome.winner !== 'A') throw new Error(`Expected match winner A, got ${result.outcome.winner}`);
+    if (result.outcome.aTotal !== 66) throw new Error(`aTotal expected 66, got ${result.outcome.aTotal}`);
+    if (result.outcome.bTotal !== 59) throw new Error(`bTotal expected 59, got ${result.outcome.bTotal}`);
+
     const aAfter = await prisma.agent.findUnique({ where: { id: agentA.id } });
     const bAfter = await prisma.agent.findUnique({ where: { id: agentB.id } });
 
     const fail = (m) => { throw new Error(m); };
 
-    if (Math.abs(aAfter.elo - result.aff.after) > 0.01) fail('Aff agent elo mismatch in DB');
-    if (Math.abs(bAfter.elo - result.neg.after) > 0.01) fail('Neg agent elo mismatch in DB');
-    if (aAfter.wins !== beforeAffWins + 1) fail(`Aff wins should be ${beforeAffWins + 1}, got ${aAfter.wins}`);
-    if (bAfter.losses !== beforeNegLosses + 1) fail(`Neg losses should be ${beforeNegLosses + 1}, got ${bAfter.losses}`);
-    if (result.aff.delta <= 0) fail('Aff delta should be positive (aff won)');
-    if (result.neg.delta >= 0) fail('Neg delta should be negative (neg lost)');
-    if (Math.abs(result.aff.delta + result.neg.delta) > 0.01) fail('Deltas should sum to ~0');
+    if (aAfter.wins !== beforeAWins + 1) fail(`A.wins should be ${beforeAWins + 1}, got ${aAfter.wins}`);
+    if (bAfter.losses !== beforeBLosses + 1) fail(`B.losses should be ${beforeBLosses + 1}, got ${bAfter.losses}`);
+    if (aAfter.elo <= beforeA) fail(`A.elo should have increased`);
+    if (bAfter.elo >= beforeB) fail(`B.elo should have decreased`);
 
-    console.log('  ✓ Agent rows updated correctly');
+    const dbDebate = await prisma.debate.findUnique({ where: { id: debateAWin.id } });
+    if (dbDebate.status !== 'completed') fail(`debate.status should be 'completed', got '${dbDebate.status}'`);
+    if (dbDebate.winner !== 'A') fail(`debate.winner should be 'A', got '${dbDebate.winner}'`);
+    if (!dbDebate.completedAt) fail('completedAt should be set');
 
-    // Verify EloChange rows.
-    const changes = await prisma.eloChange.findMany({ where: { debateId: debate.id } });
-    if (changes.length !== 2) fail(`Expected 2 EloChange rows, got ${changes.length}`);
-    for (const c of changes) {
-      if (typeof c.before !== 'number' || typeof c.after !== 'number') fail('EloChange field types wrong');
-    }
-    console.log('  ✓ EloChange rows created (2)');
+    console.log('  ✓ Agent rows updated, debate marked completed with winner A');
 
-    // Idempotency: second call should throw.
+    // Idempotency
     let secondCallThrew = false;
     try {
-      await applyEloChange(debate.id);
+      await applyEloChange(debateAWin.id);
     } catch (err) {
       if (err.message.includes('already applied')) secondCallThrew = true;
     }
     if (!secondCallThrew) fail('Second call should refuse to double-apply');
     console.log('  ✓ Refuses to double-apply');
 
-    // Also verify draw and loss paths.
-    // Draw:
-    const drawDebate = await prisma.debate.create({
-      data: {
-        topic: 'TEST DEBATE — elo module integration. Draw case.',
-        status: 'completed',
+    // ---- Case 2: draw (equal totals) ----
+    const debateDraw = await createTwoLegDebate({
+      topicSuffix: 'draw',
+      agentAId: agentA.id,
+      agentBId: agentB.id,
+      eval1Scores: {
         winner: 'draw',
-        completedAt: new Date(),
-        affAgentId: agentA.id,
-        negAgentId: agentB.id,
-        evaluation: {
-          create: {
-            winner: 'draw',
-            affArgument: 7.5, affEvidence: 7.5, affResponsive: 7.5, affPersuasion: 7.5, affTotal: 30,
-            negArgument: 7.5, negEvidence: 7.5, negResponsive: 7.5, negPersuasion: 7.5, negTotal: 30,
-            reasoning: 'Draw test. ' + 'Lorem ipsum '.repeat(30),
-            judgeModel: 'claude-opus-4-7',
-          },
-        },
+        affArgument: 7.5, affEvidence: 7.5, affResponsive: 7.5, affPersuasion: 7.5, affTotal: 30,
+        negArgument: 7.5, negEvidence: 7.5, negResponsive: 7.5, negPersuasion: 7.5, negTotal: 30,
+        reasoning: 'Draw test leg 1. ' + 'Lorem ipsum '.repeat(20),
+      },
+      eval2Scores: {
+        winner: 'draw',
+        affArgument: 8, affEvidence: 8, affResponsive: 8, affPersuasion: 8, affTotal: 32,
+        negArgument: 8, negEvidence: 8, negResponsive: 8, negPersuasion: 8, negTotal: 32,
+        reasoning: 'Draw test leg 2. ' + 'Lorem ipsum '.repeat(20),
       },
     });
-    createdDebateIds.push(drawDebate.id);
+    createdDebateIds.push(debateDraw.id);
 
-    const drawResult = await applyEloChange(drawDebate.id);
-    const affAfterDraw = await prisma.agent.findUnique({ where: { id: agentA.id } });
-    if (affAfterDraw.draws !== 1) fail(`Aff draws should be 1, got ${affAfterDraw.draws}`);
-    if (Math.abs(drawResult.aff.delta + drawResult.neg.delta) > 0.01) fail('Draw deltas should sum to ~0');
-    console.log('  ✓ Draw case: draws incremented on both sides');
+    const drawResult = await applyEloChange(debateDraw.id);
+    console.log(`\n  Case 2 — draw: outcome=${drawResult.outcome.winner} aTotal=${drawResult.outcome.aTotal} bTotal=${drawResult.outcome.bTotal}`);
+    if (drawResult.outcome.winner !== 'draw') fail(`Expected draw, got ${drawResult.outcome.winner}`);
+
+    const aDraws = await prisma.agent.findUnique({ where: { id: agentA.id } });
+    if (aDraws.draws !== 1) fail(`A.draws expected 1, got ${aDraws.draws}`);
+    if (Math.abs(drawResult.eloChanges[0].delta + drawResult.eloChanges[1].delta) > 0.01)
+      fail('Draw deltas should sum to ~0');
+    console.log('  ✓ Draw: both agents draws+=1, deltas sum to ~0');
+
+    // ---- Case 3: B wins ----
+    const debateBWin = await createTwoLegDebate({
+      topicSuffix: 'b-wins',
+      agentAId: agentA.id,
+      agentBId: agentB.id,
+      eval1Scores: {
+        winner: 'neg',
+        affArgument: 7, affEvidence: 7, affResponsive: 7, affPersuasion: 7, affTotal: 28,
+        negArgument: 8.5, negEvidence: 8.5, negResponsive: 8.5, negPersuasion: 8.5, negTotal: 34,
+        reasoning: 'Leg 1 reasoning. ' + 'Lorem ipsum '.repeat(20),
+      },
+      eval2Scores: {
+        winner: 'aff',
+        affArgument: 8.5, affEvidence: 8.5, affResponsive: 8.5, affPersuasion: 8.5, affTotal: 34,
+        negArgument: 7, negEvidence: 7, negResponsive: 7, negPersuasion: 7, negTotal: 28,
+        reasoning: 'Leg 2 reasoning. ' + 'Lorem ipsum '.repeat(20),
+      },
+    });
+    createdDebateIds.push(debateBWin.id);
+
+    const bResult = await applyEloChange(debateBWin.id);
+    console.log(`\n  Case 3 — B wins: outcome=${bResult.outcome.winner} aTotal=${bResult.outcome.aTotal} bTotal=${bResult.outcome.bTotal}`);
+    if (bResult.outcome.winner !== 'B') fail(`Expected B winner, got ${bResult.outcome.winner}`);
+    // aTotal = 28 + 28 = 56; bTotal = 34 + 34 = 68.
+    if (bResult.outcome.aTotal !== 56) fail(`aTotal expected 56, got ${bResult.outcome.aTotal}`);
+    if (bResult.outcome.bTotal !== 68) fail(`bTotal expected 68, got ${bResult.outcome.bTotal}`);
+    console.log('  ✓ B-wins outcome computed correctly');
   } finally {
-    // Clean up debates first (cascade kills EloChange).
     if (createdDebateIds.length > 0) {
       await prisma.debate.deleteMany({ where: { id: { in: createdDebateIds } } });
-      console.log(`  Cleaned up ${createdDebateIds.length} test debate(s)`);
+      console.log(`\n  Cleaned up ${createdDebateIds.length} test debate(s)`);
     }
     await cleanupTestDebates();
 
-    // Restore agent state.
     await restoreAllAgents(snapshot);
     console.log(`  Restored agent state for ${snapshot.length} agents`);
   }

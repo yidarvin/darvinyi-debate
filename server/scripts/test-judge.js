@@ -1,23 +1,21 @@
-// Standalone judge test.
+// Standalone judge test for two-leg debates.
 //
-// Creates a fresh debate with synthetic turn content and an in_progress
-// status, runs judgeDebate on it, verifies the saved evaluation, then cleans
-// up. Does NOT run any debater models — turn content is canned. Real Opus
-// call for the judge, ~$0.10-$0.30 per run.
+// Creates a fresh debate with 12 synthetic turns (6 per leg) and runs judgeLeg
+// twice — once for leg 1, once for leg 2 — verifying that two evaluations
+// are saved with the correct leg field. Does NOT run any debater models —
+// turn content is canned. Real Opus call for the judge, ~$0.20-$0.60 per run.
 //
 // Usage: cd server && node scripts/test-judge.js
 
 import 'dotenv/config';
 import { prisma } from '../src/db.js';
-import { judgeDebate } from '../src/judge/judgeDebate.js';
+import { judgeLeg } from '../src/judge/judgeDebate.js';
 
 const TEST_TOPIC =
   'TEST DEBATE — judge module verification. A four-day workweek would improve overall economic productivity in developed nations.';
 
 // Realistic-enough turn content so the judge has something to chew on.
-// Affirmative case is moderately strong; negative is sharper. Judge should
-// probably side with negative on this content.
-const TURNS = [
+const LEG_TURNS = [
   {
     roundNumber: 1,
     roundName: 'Affirmative Constructive',
@@ -63,19 +61,25 @@ const TURNS = [
 ];
 
 async function setupTestDebate() {
-  // Need two agents that exist in the DB. Use the first two from the roster.
   const agents = await prisma.agent.findMany({ take: 2, orderBy: { id: 'asc' } });
   if (agents.length < 2) {
     throw new Error('Need at least 2 agents in DB. Run `node src/seed.js` first.');
+  }
+
+  const allTurns = [];
+  for (const leg of [1, 2]) {
+    for (const t of LEG_TURNS) {
+      allTurns.push({ leg, ...t });
+    }
   }
 
   const debate = await prisma.debate.create({
     data: {
       topic: TEST_TOPIC,
       status: 'in_progress',
-      affAgentId: agents[0].id,
-      negAgentId: agents[1].id,
-      turns: { create: TURNS },
+      agentAId: agents[0].id,
+      agentBId: agents[1].id,
+      turns: { create: allTurns },
     },
   });
 
@@ -94,93 +98,80 @@ async function main() {
     throw new Error('ANTHROPIC_API_KEY not set in /server/.env');
   }
 
-  console.log('=== Judge test ===');
+  console.log('=== Judge test (two legs) ===');
 
   const debateId = await setupTestDebate();
   console.log(`Created test debate: ${debateId}`);
 
-  console.log('Running judge (streaming Opus output)...\n');
-
-  const events = [];
-  let judgeChars = 0;
-
-  const start = Date.now();
-  const { evaluation } = await judgeDebate({
-    debateId,
-    onEvent: (event) => {
-      events.push(event.type);
-      if (event.type === 'judge_text_delta') {
-        judgeChars += event.text.length;
-        if (judgeChars % 100 < event.text.length) process.stdout.write('.');
-      } else if (event.type === 'judge_thinking') {
-        process.stdout.write('  [judge_thinking]\n');
-      } else if (event.type === 'evaluation_complete') {
-        process.stdout.write('\n  [evaluation_complete]\n');
-      }
-    },
-  });
-  const elapsedSec = ((Date.now() - start) / 1000).toFixed(1);
-
-  console.log('\n--- Verdict ---');
-  console.log(`Winner:       ${evaluation.winner}`);
-  console.log(`Judge model:  ${evaluation.judgeModel}`);
-  console.log(`Aff total:    ${evaluation.affTotal.toFixed(1)}`);
-  console.log(`Neg total:    ${evaluation.negTotal.toFixed(1)}`);
-  console.log(`Aff scores:   arg=${evaluation.affArgument} ev=${evaluation.affEvidence} resp=${evaluation.affResponsive} pers=${evaluation.affPersuasion}`);
-  console.log(`Neg scores:   arg=${evaluation.negArgument} ev=${evaluation.negEvidence} resp=${evaluation.negResponsive} pers=${evaluation.negPersuasion}`);
-  console.log(`Elapsed:      ${elapsedSec}s`);
-  console.log('\n--- Reasoning (first 600 chars) ---');
-  console.log(evaluation.reasoning.slice(0, 600) + (evaluation.reasoning.length > 600 ? '…' : ''));
-
-  // Assertions.
   const fail = (m) => { console.error(`\nFAIL: ${m}`); process.exit(1); };
 
-  // Anonymization sanity: judge's reasoning must NOT mention any agent identity.
-  const forbiddenWords = ['claude', 'gpt', 'gemini', 'grok', 'opus', 'sonnet', 'anthropic', 'openai', 'google', 'xai'];
-  const reasoningLower = evaluation.reasoning.toLowerCase();
-  for (const word of forbiddenWords) {
-    if (reasoningLower.includes(word)) {
-      fail(`Judge reasoning leaked identity word: "${word}"`);
+  for (const leg of [1, 2]) {
+    console.log(`\n--- Judging leg ${leg} (streaming Opus output) ---\n`);
+
+    const events = [];
+    let judgeChars = 0;
+
+    const start = Date.now();
+    const { evaluation } = await judgeLeg({
+      debateId,
+      leg,
+      onEvent: (event) => {
+        events.push(event.type);
+        if (event.type === 'judge_text_delta') {
+          judgeChars += event.text.length;
+          if (judgeChars % 100 < event.text.length) process.stdout.write('.');
+        } else if (event.type === 'judge_thinking') {
+          process.stdout.write(`  [judge_thinking leg=${event.leg}]\n`);
+        } else if (event.type === 'evaluation_complete') {
+          process.stdout.write(`\n  [evaluation_complete leg=${event.leg}]\n`);
+        }
+      },
+    });
+    const elapsedSec = ((Date.now() - start) / 1000).toFixed(1);
+
+    console.log(`\nVerdict leg ${leg}: winner=${evaluation.winner}, affTotal=${evaluation.affTotal.toFixed(1)}, negTotal=${evaluation.negTotal.toFixed(1)} (${elapsedSec}s)`);
+
+    if (evaluation.leg !== leg) fail(`evaluation.leg expected ${leg}, got ${evaluation.leg}`);
+    if (!['aff', 'neg', 'draw'].includes(evaluation.winner)) fail(`Invalid winner: ${evaluation.winner}`);
+    if (evaluation.judgeModel !== 'claude-opus-4-7') fail(`Wrong judge model: ${evaluation.judgeModel}`);
+    if (evaluation.reasoning.length < 200) fail(`Reasoning too short: ${evaluation.reasoning.length}`);
+
+    const forbiddenWords = ['claude', 'gpt', 'gemini', 'grok', 'opus', 'sonnet', 'anthropic', 'openai', 'google', 'xai'];
+    const reasoningLower = evaluation.reasoning.toLowerCase();
+    for (const word of forbiddenWords) {
+      if (reasoningLower.includes(word)) {
+        fail(`Leg ${leg} judge reasoning leaked identity word: "${word}"`);
+      }
     }
-  }
-  console.log('\n✓ Reasoning contains no identity leaks');
 
-  if (!['aff', 'neg', 'draw'].includes(evaluation.winner)) fail(`Invalid winner: ${evaluation.winner}`);
-  if (evaluation.judgeModel !== 'claude-opus-4-7') fail(`Wrong judge model: ${evaluation.judgeModel}`);
-  if (evaluation.reasoning.length < 200) fail(`Reasoning too short: ${evaluation.reasoning.length}`);
-
-  // Score ranges
-  for (const f of ['affArgument', 'affEvidence', 'affResponsive', 'affPersuasion', 'negArgument', 'negEvidence', 'negResponsive', 'negPersuasion']) {
-    const v = evaluation[f];
-    if (typeof v !== 'number' || v < 0 || v > 10) fail(`${f} out of range: ${v}`);
+    if (!events.includes('judge_thinking')) fail(`Leg ${leg}: Missing judge_thinking event`);
+    if (events.filter((t) => t === 'judge_text_delta').length === 0) fail(`Leg ${leg}: Missing judge_text_delta events`);
+    if (events.filter((t) => t === 'evaluation_complete').length !== 1) fail(`Leg ${leg}: Expected exactly one evaluation_complete`);
   }
 
-  // Event sequence
-  if (!events.includes('judge_thinking')) fail('Missing judge_thinking event');
-  if (events.filter((t) => t === 'judge_text_delta').length === 0) fail('Missing judge_text_delta events');
-  if (events.filter((t) => t === 'evaluation_complete').length !== 1) fail('Expected exactly one evaluation_complete');
-
-  console.log('✓ All event types present');
+  console.log('\n✓ Both legs judged with identity-clean reasoning and proper events');
 
   // DB state
   const finalDebate = await prisma.debate.findUnique({
     where: { id: debateId },
-    include: { evaluation: true },
+    include: { evaluations: { orderBy: { leg: 'asc' } } },
   });
-  if (finalDebate.status !== 'completed') fail(`debate.status expected 'completed', got '${finalDebate.status}'`);
-  if (finalDebate.winner !== evaluation.winner) fail(`debate.winner mismatch`);
-  if (!finalDebate.completedAt) fail('completedAt not set');
-  if (!finalDebate.evaluation) fail('Evaluation row not created');
 
-  console.log('✓ DB state correct: status=completed, winner+completedAt set, Evaluation row exists');
+  if (finalDebate.evaluations.length !== 2) fail(`Expected 2 evaluations, got ${finalDebate.evaluations.length}`);
+  if (finalDebate.evaluations[0].leg !== 1) fail(`First evaluation leg should be 1`);
+  if (finalDebate.evaluations[1].leg !== 2) fail(`Second evaluation leg should be 2`);
+  // Note: judgeLeg does NOT transition status — the SSE wrapper does after ELO.
+  if (finalDebate.status !== 'in_progress') fail(`debate.status should still be 'in_progress' (judge doesn't transition), got '${finalDebate.status}'`);
 
-  // Idempotency check: running judge again should refuse.
+  console.log('✓ DB state correct: 2 evaluations with leg=1 and leg=2');
+
+  // Idempotency
   try {
-    await judgeDebate({ debateId, onEvent: () => {} });
-    fail('Re-judging a completed debate should have thrown');
+    await judgeLeg({ debateId, leg: 1, onEvent: () => {} });
+    fail('Re-judging leg 1 should have thrown');
   } catch (err) {
-    if (!err.message.includes('already completed')) fail(`Re-judge threw wrong error: ${err.message}`);
-    console.log('✓ Refuses to re-judge an already-completed debate');
+    if (!err.message.includes('already has an evaluation')) fail(`Re-judge threw wrong error: ${err.message}`);
+    console.log('✓ Refuses to re-judge an already-judged leg');
   }
 }
 

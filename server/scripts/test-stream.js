@@ -1,4 +1,4 @@
-// End-to-end SSE streaming test.
+// End-to-end SSE streaming test for two-leg matches.
 //
 // Requires:
 //   - Dev server running on PORT (default 3001): `npm run dev` in /server
@@ -8,9 +8,9 @@
 //
 // Override base URL or agent pairing via env:
 //   BASE_URL=http://localhost:3001 node scripts/test-stream.js
-//   AFF_AGENT_ID=claude-sonnet-4-6 NEG_AGENT_ID=gemini-2-5-pro node scripts/test-stream.js
+//   AGENT_A_ID=claude-sonnet-4-6 AGENT_B_ID=gemini-2-5-pro node scripts/test-stream.js
 //
-// Cost: $0.50-$5.00 (default pairing is the cheapest, but still a full debate).
+// Cost: $1.00-$10.00 (two-leg debate against real models).
 
 import 'dotenv/config';
 import { prisma } from '../src/db.js';
@@ -19,12 +19,6 @@ const BASE_URL = process.env.BASE_URL || `http://localhost:${process.env.PORT ||
 const KEYPHRASE = process.env.DEBATE_KEYPHRASE;
 const TEST_TOPIC =
   'TEST DEBATE — SSE stream end-to-end. A four-day workweek would improve overall economic productivity in developed nations.';
-
-// ----------------------------------------------------------------------------
-// Snapshot/restore agent stats so test runs are non-destructive. The full
-// stream test ends with the judge + ELO firing, which permanently mutates
-// agent.elo and win/loss/draw counters. We snapshot before and restore after.
-// ----------------------------------------------------------------------------
 
 async function snapshotAllAgents() {
   return prisma.agent.findMany({
@@ -47,7 +41,7 @@ if (!KEYPHRASE || KEYPHRASE === 'change_me_before_deploying') {
 }
 
 // ============================================================================
-// SSE parser — minimal, handles the wire format we emit.
+// SSE parser
 // ============================================================================
 
 async function* parseSSE(response) {
@@ -65,7 +59,6 @@ async function* parseSSE(response) {
       const rawEvent = buffer.slice(0, separatorIndex);
       buffer = buffer.slice(separatorIndex + 2);
 
-      // Skip heartbeat comments
       if (rawEvent.startsWith(':')) continue;
 
       let eventType = 'message';
@@ -94,13 +87,12 @@ async function* parseSSE(response) {
 }
 
 // ============================================================================
-// Pre-flight checks
+// Pre-flight
 // ============================================================================
 
 async function preflightAuth() {
   console.log('\n=== PHASE A: Auth and validation ===');
 
-  // No key → 401
   let r = await fetch(`${BASE_URL}/api/debates`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -109,7 +101,6 @@ async function preflightAuth() {
   console.assert(r.status === 401, `No-key POST expected 401, got ${r.status}`);
   console.log('  ✓ POST without key → 401');
 
-  // Wrong key → 401
   r = await fetch(`${BASE_URL}/api/debates`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Debate-Key': 'wrong-key' },
@@ -118,7 +109,6 @@ async function preflightAuth() {
   console.assert(r.status === 401, `Wrong-key POST expected 401, got ${r.status}`);
   console.log('  ✓ POST with wrong key → 401');
 
-  // Empty topic → 400
   r = await fetch(`${BASE_URL}/api/debates`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Debate-Key': KEYPHRASE },
@@ -127,7 +117,6 @@ async function preflightAuth() {
   console.assert(r.status === 400, `Empty-topic expected 400, got ${r.status}`);
   console.log('  ✓ POST with empty topic → 400');
 
-  // Too-long topic → 400
   r = await fetch(`${BASE_URL}/api/debates`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Debate-Key': KEYPHRASE },
@@ -136,7 +125,6 @@ async function preflightAuth() {
   console.assert(r.status === 400, `Too-long topic expected 400, got ${r.status}`);
   console.log('  ✓ POST with >500-char topic → 400');
 
-  // Nonexistent rerun → 404
   r = await fetch(`${BASE_URL}/api/debates`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Debate-Key': KEYPHRASE },
@@ -145,20 +133,18 @@ async function preflightAuth() {
   console.assert(r.status === 404, `Nonexistent rerunOf expected 404, got ${r.status}`);
   console.log('  ✓ POST with nonexistent rerunOf → 404');
 
-  // Stream of nonexistent debate → 404
   r = await fetch(`${BASE_URL}/api/debates/nonexistent-debate-id/stream`);
   console.assert(r.status === 404, `Nonexistent stream expected 404, got ${r.status}`);
   console.log('  ✓ GET /:nonexistent/stream → 404');
 }
 
 // ============================================================================
-// End-to-end streaming
+// End-to-end stream
 // ============================================================================
 
 async function endToEndStream() {
-  console.log('\n=== PHASE B: End-to-end live stream ===');
+  console.log('\n=== PHASE B: End-to-end live stream (two-leg) ===');
 
-  // 1. Create debate.
   const createRes = await fetch(`${BASE_URL}/api/debates`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Debate-Key': KEYPHRASE },
@@ -173,7 +159,6 @@ async function endToEndStream() {
   const { debateId } = await createRes.json();
   console.log(`  Created debate: ${debateId}`);
 
-  // 2. Open the stream.
   const streamRes = await fetch(`${BASE_URL}/api/debates/${debateId}/stream`);
   console.assert(streamRes.status === 200, `Stream status expected 200, got ${streamRes.status}`);
   console.assert(
@@ -182,14 +167,19 @@ async function endToEndStream() {
   );
   console.log('  Stream opened (200, text/event-stream)');
 
-  // 3. Consume events.
   const counts = {
     debate_start: 0,
+    leg_start: 0,
+    leg_complete: 0,
     text_delta: 0,
     tool_call_start: 0,
     tool_call_end: 0,
     round_complete: 0,
-    all_rounds_complete: 0,
+    all_legs_complete: 0,
+    judge_thinking: 0,
+    judge_text_delta: 0,
+    evaluation_complete: 0,
+    elo_updated: 0,
     debate_complete: 0,
     error: 0,
   };
@@ -197,17 +187,19 @@ async function endToEndStream() {
   const roundsSeen = new Set();
   let lastRound = null;
   const start = Date.now();
+  let finalDebateComplete = null;
 
   for await (const event of parseSSE(streamRes)) {
     counts[event.type] = (counts[event.type] || 0) + 1;
 
     if (event.type === 'round_complete') {
-      roundsSeen.add(event.data.round);
-      if (event.data.round !== lastRound) {
+      roundsSeen.add(`${event.data.leg}.${event.data.round}`);
+      const key = `${event.data.leg}.${event.data.round}`;
+      if (key !== lastRound) {
         process.stdout.write(
-          `\n  ✓ Round ${event.data.round} (${event.data.side}) — ${event.data.content?.length ?? 0} chars`,
+          `\n  ✓ Leg ${event.data.leg} Round ${event.data.round} (${event.data.side}) — ${event.data.content?.length ?? 0} chars`,
         );
-        lastRound = event.data.round;
+        lastRound = key;
       }
     } else if (event.type === 'text_delta') {
       if (counts.text_delta % 50 === 0) process.stdout.write('.');
@@ -215,13 +207,21 @@ async function endToEndStream() {
       process.stdout.write(`\n    → ${event.data.tool}`);
     } else if (event.type === 'tool_call_end') {
       process.stdout.write(`\n    ← ${event.data.tool}: ${event.data.outputSummary}`);
-    } else if (event.type === 'all_rounds_complete') {
-      process.stdout.write('\n  ✓ all_rounds_complete');
+    } else if (event.type === 'leg_start') {
+      process.stdout.write(`\n  ▶ leg ${event.data.leg} start`);
+    } else if (event.type === 'leg_complete') {
+      process.stdout.write(`\n  ■ leg ${event.data.leg} complete`);
+    } else if (event.type === 'all_legs_complete') {
+      process.stdout.write('\n  ✓ all_legs_complete');
+    } else if (event.type === 'judge_thinking') {
+      process.stdout.write(`\n  ⚖  judge_thinking leg=${event.data.leg}`);
+    } else if (event.type === 'evaluation_complete') {
+      process.stdout.write(`\n  ⚖  evaluation_complete leg=${event.data.leg} → ${event.data.winner}`);
+    } else if (event.type === 'elo_updated') {
+      process.stdout.write('\n  📈 elo_updated');
     } else if (event.type === 'debate_complete') {
       process.stdout.write('\n  ✓ debate_complete');
-      console.log(
-        `\n     Identities: aff=${event.data.affAgent?.displayName}, neg=${event.data.negAgent?.displayName}`,
-      );
+      finalDebateComplete = event.data;
     } else if (event.type === 'error') {
       console.log(`\n  ! error: ${event.data.message}`);
     } else if (event.type === 'debate_start') {
@@ -235,13 +235,25 @@ async function endToEndStream() {
   console.log(`  Counts:    ${JSON.stringify(counts)}`);
   console.log(`  Rounds:    ${[...roundsSeen].sort().join(', ')}`);
 
-  // Assertions
+  if (finalDebateComplete) {
+    console.log(`  Identities: A=${finalDebateComplete.agentA?.displayName}, B=${finalDebateComplete.agentB?.displayName}`);
+    console.log(`  Match winner: ${finalDebateComplete.winner}`);
+    if (finalDebateComplete.matchOutcome) {
+      console.log(`  Match scores: aTotal=${finalDebateComplete.matchOutcome.aTotal}, bTotal=${finalDebateComplete.matchOutcome.bTotal}`);
+      console.log(`  Per-leg winners: leg1=${finalDebateComplete.matchOutcome.leg1Winner}, leg2=${finalDebateComplete.matchOutcome.leg2Winner}`);
+    }
+  }
+
   const fail = (m) => { console.error(`FAIL: ${m}`); process.exit(1); };
 
   if (counts.debate_start !== 1) fail(`Expected 1 debate_start, got ${counts.debate_start}`);
-  if (roundsSeen.size !== 6) fail(`Expected 6 rounds, got ${roundsSeen.size}`);
-  if (counts.all_rounds_complete !== 1) fail(`Expected 1 all_rounds_complete, got ${counts.all_rounds_complete}`);
+  if (counts.leg_start !== 2) fail(`Expected 2 leg_start, got ${counts.leg_start}`);
+  if (counts.leg_complete !== 2) fail(`Expected 2 leg_complete, got ${counts.leg_complete}`);
+  if (roundsSeen.size !== 12) fail(`Expected 12 rounds (6 per leg × 2), got ${roundsSeen.size}`);
+  if (counts.all_legs_complete !== 1) fail(`Expected 1 all_legs_complete, got ${counts.all_legs_complete}`);
+  if (counts.evaluation_complete !== 2) fail(`Expected 2 evaluation_complete, got ${counts.evaluation_complete}`);
   if (counts.debate_complete !== 1) fail(`Expected 1 debate_complete, got ${counts.debate_complete}`);
+  if (counts.elo_updated !== 1) fail(`Expected 1 elo_updated, got ${counts.elo_updated}`);
   if (counts.text_delta < 50) fail(`Expected substantial text streaming, got ${counts.text_delta} deltas`);
   if (counts.error !== 0) fail(`Expected no error events, got ${counts.error}`);
 
@@ -251,39 +263,33 @@ async function endToEndStream() {
 }
 
 // ============================================================================
-// Replay test — re-opening the stream on a completed debate
+// Replay
 // ============================================================================
 
 async function replayCompleted(debateId) {
   console.log('\n=== PHASE C: Replay completed debate via stream ===');
 
-  // The debate should now be in_progress (orchestrator finished, judge not run).
-  // For Prompt 12 we accept that state. Phase C verifies the in_progress path:
-  // the stream replays saved turns and emits an info-level error message.
   const streamRes = await fetch(`${BASE_URL}/api/debates/${debateId}/stream`);
   console.assert(streamRes.status === 200, `Re-stream status expected 200, got ${streamRes.status}`);
 
   const eventTypes = [];
-  let firstError = null;
 
   for await (const event of parseSSE(streamRes)) {
     eventTypes.push(event.type);
-    if (event.type === 'error' && !firstError) {
-      firstError = event.data.message;
-    }
   }
 
   console.log(`  Event types received: ${eventTypes.join(', ')}`);
-  if (firstError) console.log(`  First error message: ${firstError}`);
 
   console.assert(eventTypes.includes('debate_start'), 'Replay missing debate_start');
-  console.assert(eventTypes.filter((t) => t === 'round_complete').length === 6, 'Replay missing 6 round_complete events');
+  console.assert(eventTypes.filter((t) => t === 'leg_start').length === 2, 'Replay missing 2 leg_start');
+  console.assert(eventTypes.filter((t) => t === 'leg_complete').length === 2, 'Replay missing 2 leg_complete');
+  console.assert(eventTypes.filter((t) => t === 'round_complete').length === 12, 'Replay missing 12 round_complete');
+  console.assert(eventTypes.filter((t) => t === 'evaluation_complete').length === 2, 'Replay missing 2 evaluation_complete');
+  console.assert(eventTypes.includes('debate_complete'), 'Replay missing debate_complete');
 
-  console.log('  ✓ Replay returned saved turns');
+  console.log('  ✓ Replay returned saved turns + evaluations + reveal');
 }
 
-// ============================================================================
-// Cleanup
 // ============================================================================
 
 async function cleanup() {
@@ -293,10 +299,6 @@ async function cleanup() {
   });
   console.log(`  Swept ${swept.count} test debate(s).`);
 }
-
-// ============================================================================
-// Main
-// ============================================================================
 
 (async () => {
   let debateId = null;

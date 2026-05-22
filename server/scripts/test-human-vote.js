@@ -1,11 +1,11 @@
-// Tests for the human vote system.
-//   Phase A: AGREE path — vote matches judge, no ELO change, agreement recorded
-//   Phase B: DISAGREE path — vote differs, ELO reversed + reapplied, override recorded
-//   Phase C: ROUND-TRIP IDENTITY — judge picks aff, human flips to neg; final ELO
-//            should equal what it would have been if neg had been declared winner
-//            from the start. This is the critical invariant.
-//   Phase D: DOUBLE VOTE refused
-//   Phase E: VOTE ON UNCOMPLETED DEBATE refused
+// Tests for the per-leg human vote system.
+//
+// Human votes are agreement-tracking ONLY — they don't touch ELO or W/L/D.
+// Phases:
+//   A: AGREE     — vote matches judge for a leg, agreement recorded
+//   B: DISAGREE  — vote differs, override recorded; ELO must NOT change
+//   D: DOUBLE-VOTE per leg refused
+//   E: VOTE on leg without evaluation refused
 //
 // Usage: cd server && node scripts/test-human-vote.js
 //
@@ -14,8 +14,7 @@
 import 'dotenv/config';
 import { prisma } from '../src/db.js';
 import { applyEloChange } from '../src/elo/applyEloChange.js';
-import { applyHumanVote } from '../src/elo/applyHumanVote.js';
-import { calculateNewRatings } from '../src/elo/calculate.js';
+import { recordHumanVote } from '../src/elo/applyHumanVote.js';
 
 const TOPIC_PREFIX = 'TEST DEBATE — human vote';
 
@@ -46,34 +45,59 @@ async function cleanupTestDebates() {
 }
 
 /**
- * Creates a synthetic completed debate with evaluation + EloChange rows.
- * Returns the debateId. Uses the two first agents by id-alphabetical sort.
+ * Creates a synthetic completed two-leg debate with two evaluations + applies ELO.
+ * Both legs have the same per-leg winner (specified by leg1Winner/leg2Winner).
  */
-async function createSyntheticCompletedDebate({ topicSuffix, judgeWinner }) {
+async function createSyntheticCompletedDebate({ topicSuffix, leg1Winner, leg2Winner }) {
   const [agentA, agentB] = await prisma.agent.findMany({ take: 2, orderBy: { id: 'asc' } });
+
+  // Make scores reflect the winners. Margin of 4 to keep things simple.
+  const eval1 = scoresForWinner(leg1Winner);
+  const eval2 = scoresForWinner(leg2Winner);
 
   const debate = await prisma.debate.create({
     data: {
       topic: `${TOPIC_PREFIX} ${topicSuffix}`,
-      status: 'completed',
-      winner: judgeWinner,
-      completedAt: new Date(),
-      affAgentId: agentA.id,
-      negAgentId: agentB.id,
-      evaluation: {
-        create: {
-          winner: judgeWinner,
-          affArgument: 8, affEvidence: 8, affResponsive: 8, affPersuasion: 8, affTotal: 32,
-          negArgument: 7, negEvidence: 7, negResponsive: 7, negPersuasion: 7, negTotal: 28,
-          reasoning: 'Test reasoning ' + 'Lorem ipsum '.repeat(30),
-          judgeModel: 'claude-opus-4-7',
-        },
+      status: 'judging',
+      agentAId: agentA.id,
+      agentBId: agentB.id,
+      evaluations: {
+        create: [
+          { leg: 1, ...eval1, judgeModel: 'claude-opus-4-7' },
+          { leg: 2, ...eval2, judgeModel: 'claude-opus-4-7' },
+        ],
       },
     },
   });
 
   await applyEloChange(debate.id);
   return debate.id;
+}
+
+function scoresForWinner(winner) {
+  // 4 axes per side. Strong side gets 8s, weak gets 7s; draw is equal.
+  if (winner === 'aff') {
+    return {
+      winner: 'aff',
+      affArgument: 8, affEvidence: 8, affResponsive: 8, affPersuasion: 8, affTotal: 32,
+      negArgument: 7, negEvidence: 7, negResponsive: 7, negPersuasion: 7, negTotal: 28,
+      reasoning: `Reasoning aff. ` + 'Lorem ipsum '.repeat(30),
+    };
+  }
+  if (winner === 'neg') {
+    return {
+      winner: 'neg',
+      affArgument: 7, affEvidence: 7, affResponsive: 7, affPersuasion: 7, affTotal: 28,
+      negArgument: 8, negEvidence: 8, negResponsive: 8, negPersuasion: 8, negTotal: 32,
+      reasoning: `Reasoning neg. ` + 'Lorem ipsum '.repeat(30),
+    };
+  }
+  return {
+    winner: 'draw',
+    affArgument: 7.5, affEvidence: 7.5, affResponsive: 7.5, affPersuasion: 7.5, affTotal: 30,
+    negArgument: 7.5, negEvidence: 7.5, negResponsive: 7.5, negPersuasion: 7.5, negTotal: 30,
+    reasoning: `Reasoning draw. ` + 'Lorem ipsum '.repeat(30),
+  };
 }
 
 function approxEqual(a, b, tolerance = 0.01) {
@@ -87,35 +111,40 @@ function approxEqual(a, b, tolerance = 0.01) {
 async function phaseA() {
   console.log('\n=== PHASE A: AGREE path ===');
 
-  const debateId = await createSyntheticCompletedDebate({ topicSuffix: 'phase-A', judgeWinner: 'aff' });
+  const debateId = await createSyntheticCompletedDebate({
+    topicSuffix: 'phase-A',
+    leg1Winner: 'aff',
+    leg2Winner: 'neg',
+  });
 
   const agentsBeforeVote = await prisma.agent.findMany();
-  const eloChangesBefore = await prisma.eloChange.findMany({ where: { debateId } });
-  if (eloChangesBefore.length !== 2) throw new Error('Expected 2 EloChange rows after applyEloChange');
 
-  const result = await applyHumanVote(debateId, 'aff');
+  const result = await recordHumanVote(debateId, 1, 'aff');
 
-  console.log(`  agreed: ${result.agreed}, humanWinner: ${result.humanWinner}, judgeWinner: ${result.judgeWinner}`);
+  console.log(`  Leg 1 vote — agreed: ${result.agreed}, humanWinner: ${result.humanWinner}, judgeWinner: ${result.judgeWinner}`);
   if (!result.agreed) throw new Error('Expected agreed=true');
-  if (result.finalWinner !== 'aff') throw new Error('Final winner should be aff');
+  if (result.leg !== 1) throw new Error(`leg expected 1, got ${result.leg}`);
 
   const agentsAfterVote = await prisma.agent.findMany();
   for (const before of agentsBeforeVote) {
     const after = agentsAfterVote.find((a) => a.id === before.id);
     if (!approxEqual(before.elo, after.elo)) {
-      throw new Error(`Agent ${before.id} elo changed on agreement (${before.elo} → ${after.elo})`);
+      throw new Error(`Agent ${before.id} elo changed on vote (${before.elo} → ${after.elo})`);
     }
     if (before.wins !== after.wins || before.losses !== after.losses || before.draws !== after.draws) {
-      throw new Error(`Agent ${before.id} W/L/D changed on agreement`);
+      throw new Error(`Agent ${before.id} W/L/D changed on vote`);
     }
   }
-  console.log('  ✓ No ELO or W/L/D changes after agreement');
+  console.log('  ✓ No ELO or W/L/D changes on vote');
 
-  const evaluation = await prisma.evaluation.findFirst({ where: { debateId } });
-  if (evaluation.humanWinner !== 'aff') throw new Error('humanWinner not set');
-  if (evaluation.humanAgreedWithJudge !== true) throw new Error('humanAgreedWithJudge should be true');
-  if (!evaluation.humanVotedAt) throw new Error('humanVotedAt should be set');
-  console.log('  ✓ Evaluation flags set correctly');
+  const evaluations = await prisma.evaluation.findMany({ where: { debateId }, orderBy: { leg: 'asc' } });
+  const leg1Eval = evaluations[0];
+  const leg2Eval = evaluations[1];
+  if (leg1Eval.humanWinner !== 'aff') throw new Error('leg1 humanWinner not set');
+  if (leg1Eval.humanAgreedWithJudge !== true) throw new Error('leg1 humanAgreedWithJudge should be true');
+  if (!leg1Eval.humanVotedAt) throw new Error('leg1 humanVotedAt should be set');
+  if (leg2Eval.humanWinner !== null) throw new Error('leg2 humanWinner should still be null');
+  console.log('  ✓ Leg 1 evaluation flags set; leg 2 unaffected');
 
   return debateId;
 }
@@ -127,142 +156,88 @@ async function phaseA() {
 async function phaseB() {
   console.log('\n=== PHASE B: DISAGREE path ===');
 
-  const debateId = await createSyntheticCompletedDebate({ topicSuffix: 'phase-B', judgeWinner: 'aff' });
+  const debateId = await createSyntheticCompletedDebate({
+    topicSuffix: 'phase-B',
+    leg1Winner: 'aff',
+    leg2Winner: 'neg',
+  });
 
-  const [agentA, agentB] = await prisma.agent.findMany({ take: 2, orderBy: { id: 'asc' } });
-  const affEloAfterJudge = agentA.elo;
-  const negEloAfterJudge = agentB.elo;
-  const affWinsAfterJudge = agentA.wins;
-  const negLossesAfterJudge = agentB.losses;
+  const agentsBefore = await prisma.agent.findMany();
+  const debateBefore = await prisma.debate.findUnique({ where: { id: debateId } });
 
-  console.log(`  After judge: aff=${affEloAfterJudge.toFixed(2)} (${affWinsAfterJudge}W), neg=${negEloAfterJudge.toFixed(2)} (${negLossesAfterJudge}L)`);
+  const result = await recordHumanVote(debateId, 2, 'aff');
 
-  const result = await applyHumanVote(debateId, 'neg');
-
-  console.log(`  agreed: ${result.agreed}, humanWinner: ${result.humanWinner}, judgeWinner: ${result.judgeWinner}`);
+  console.log(`  Leg 2 vote (neg→aff) — agreed: ${result.agreed}`);
   if (result.agreed) throw new Error('Expected agreed=false');
-  if (result.finalWinner !== 'neg') throw new Error('Final winner should be neg');
+  if (result.leg !== 2) throw new Error(`leg expected 2, got ${result.leg}`);
 
-  const [agentAAfter, agentBAfter] = await prisma.agent.findMany({ take: 2, orderBy: { id: 'asc' } });
-
-  console.log(`  After human:  aff=${agentAAfter.elo.toFixed(2)} (${agentAAfter.wins}W ${agentAAfter.losses}L), neg=${agentBAfter.elo.toFixed(2)} (${agentBAfter.wins}W ${agentBAfter.losses}L)`);
-
-  // Aff should have lost ELO (no longer wins)
-  if (agentAAfter.elo >= affEloAfterJudge) {
-    throw new Error(`Aff elo should have decreased after override (was ${affEloAfterJudge}, now ${agentAAfter.elo})`);
+  // Verify ELO/W/L/D didn't change
+  const agentsAfter = await prisma.agent.findMany();
+  for (const before of agentsBefore) {
+    const after = agentsAfter.find((a) => a.id === before.id);
+    if (!approxEqual(before.elo, after.elo)) {
+      throw new Error(`Agent ${before.id} elo changed on disagree vote (${before.elo} → ${after.elo})`);
+    }
+    if (before.wins !== after.wins || before.losses !== after.losses || before.draws !== after.draws) {
+      throw new Error(`Agent ${before.id} W/L/D changed on disagree vote`);
+    }
   }
-  if (agentAAfter.wins !== affWinsAfterJudge - 1) {
-    throw new Error(`Aff wins should have decremented from ${affWinsAfterJudge} to ${affWinsAfterJudge - 1}, got ${agentAAfter.wins}`);
-  }
-  if (agentAAfter.losses !== agentA.losses - 0 + 1) {
-    throw new Error(`Aff losses should have incremented`);
-  }
-  console.log('  ✓ Aff lost a win and gained a loss');
+  console.log('  ✓ No ELO or W/L/D changes on disagree (votes are tracking-only)');
 
-  // Neg should have gained ELO
-  if (agentBAfter.elo <= negEloAfterJudge) {
-    throw new Error(`Neg elo should have increased after override`);
-  }
-  if (agentBAfter.wins !== agentB.wins + 1) {
-    throw new Error(`Neg wins should have incremented`);
-  }
-  if (agentBAfter.losses !== negLossesAfterJudge - 1) {
-    throw new Error(`Neg losses should have decremented`);
-  }
-  console.log('  ✓ Neg gained a win and lost a loss');
+  // Debate.winner should be unchanged
+  const debateAfter = await prisma.debate.findUnique({ where: { id: debateId } });
+  if (debateAfter.winner !== debateBefore.winner)
+    throw new Error(`debate.winner changed (${debateBefore.winner} → ${debateAfter.winner}); votes must not affect match outcome`);
+  console.log('  ✓ debate.winner unchanged by vote');
 
-  // EloChange rows should now reflect the new verdict
-  const eloChanges = await prisma.eloChange.findMany({ where: { debateId } });
-  if (eloChanges.length !== 2) throw new Error(`Expected 2 EloChange rows, got ${eloChanges.length}`);
-  const affChange = eloChanges.find((c) => c.agentId === agentA.id);
-  if (affChange.delta >= 0) throw new Error(`Aff EloChange.delta should be negative (aff lost), got ${affChange.delta}`);
-  console.log('  ✓ New EloChange rows reflect neg-wins verdict');
-
-  // Debate.winner should now be 'neg'
-  const debate = await prisma.debate.findUnique({ where: { id: debateId } });
-  if (debate.winner !== 'neg') throw new Error(`debate.winner should be 'neg', got ${debate.winner}`);
-  console.log('  ✓ debate.winner updated to neg');
-
-  // Evaluation flags
-  const evaluation = await prisma.evaluation.findFirst({ where: { debateId } });
-  if (evaluation.winner !== 'aff') throw new Error('evaluation.winner should still be aff (judge unchanged)');
-  if (evaluation.humanWinner !== 'neg') throw new Error('evaluation.humanWinner should be neg');
-  if (evaluation.humanAgreedWithJudge !== false) throw new Error('humanAgreedWithJudge should be false');
-  console.log('  ✓ Evaluation: judge=aff, human=neg, agreed=false');
+  const evaluations = await prisma.evaluation.findMany({ where: { debateId }, orderBy: { leg: 'asc' } });
+  if (evaluations[1].winner !== 'neg') throw new Error('judge verdict should remain neg');
+  if (evaluations[1].humanWinner !== 'aff') throw new Error('humanWinner should be aff');
+  if (evaluations[1].humanAgreedWithJudge !== false) throw new Error('humanAgreedWithJudge should be false');
+  console.log('  ✓ Leg 2 evaluation: judge=neg, human=aff, agreed=false');
 
   return debateId;
 }
 
 // ============================================================================
-// Phase C — Round-trip identity
-// ============================================================================
-
-async function phaseC() {
-  console.log('\n=== PHASE C: ROUND-TRIP identity ===');
-  console.log('  Setup: two fresh debates with identical starting state. Debate 1 has judge=aff');
-  console.log('  then human flips to neg. Debate 2 has judge=neg directly. Final ELO must match.');
-
-  // Snapshot original state.
-  const snapshot = await snapshotAllAgents();
-
-  // Path A: judge says aff, human flips to neg.
-  const debate1Id = await createSyntheticCompletedDebate({ topicSuffix: 'phase-C-pathA', judgeWinner: 'aff' });
-  await applyHumanVote(debate1Id, 'neg');
-  const pathAResult = await prisma.agent.findMany({ orderBy: { id: 'asc' } });
-
-  // Restore for Path B.
-  await restoreAllAgents(snapshot);
-
-  // Path B: judge says neg directly. No human vote.
-  const debate2Id = await createSyntheticCompletedDebate({ topicSuffix: 'phase-C-pathB', judgeWinner: 'neg' });
-  const pathBResult = await prisma.agent.findMany({ orderBy: { id: 'asc' } });
-
-  // Compare.
-  for (let i = 0; i < pathAResult.length; i++) {
-    const a = pathAResult[i];
-    const b = pathBResult[i];
-    if (a.id !== b.id) throw new Error(`Mismatched agent order`);
-    if (!approxEqual(a.elo, b.elo, 0.01)) {
-      throw new Error(`Agent ${a.id} ELO mismatch: pathA=${a.elo} vs pathB=${b.elo} (diff ${(a.elo - b.elo).toFixed(4)})`);
-    }
-    if (a.wins !== b.wins) throw new Error(`Agent ${a.id} wins mismatch: pathA=${a.wins} pathB=${b.wins}`);
-    if (a.losses !== b.losses) throw new Error(`Agent ${a.id} losses mismatch: pathA=${a.losses} pathB=${b.losses}`);
-    if (a.draws !== b.draws) throw new Error(`Agent ${a.id} draws mismatch`);
-  }
-
-  console.log(`  ✓ Path A (judge=aff → human=neg) produces identical agent state to Path B (judge=neg directly)`);
-  console.log(`    Both paths end at: ${pathAResult.map(a => `${a.id}=${a.elo.toFixed(2)}/${a.wins}W/${a.losses}L`).join(', ')}`);
-}
-
-// ============================================================================
-// Phase D — Double vote refused
+// Phase D — Double vote on same leg refused
 // ============================================================================
 
 async function phaseD() {
-  console.log('\n=== PHASE D: Double vote refused ===');
+  console.log('\n=== PHASE D: Double-vote on same leg refused ===');
 
-  const debateId = await createSyntheticCompletedDebate({ topicSuffix: 'phase-D', judgeWinner: 'aff' });
-  await applyHumanVote(debateId, 'aff');
+  const debateId = await createSyntheticCompletedDebate({
+    topicSuffix: 'phase-D',
+    leg1Winner: 'aff',
+    leg2Winner: 'aff',
+  });
+
+  await recordHumanVote(debateId, 1, 'aff');
 
   let threw = false;
   try {
-    await applyHumanVote(debateId, 'aff');
+    await recordHumanVote(debateId, 1, 'aff');
   } catch (err) {
     if (err.message.includes('already has a human vote')) threw = true;
     else throw err;
   }
-  if (!threw) throw new Error('Second vote should have been refused');
-  console.log('  ✓ Second vote on same debate refused with clear error');
+  if (!threw) throw new Error('Second vote on same leg should have been refused');
+  console.log('  ✓ Second vote on leg 1 refused');
+
+  // Voting on leg 2 should still work.
+  const r2 = await recordHumanVote(debateId, 2, 'neg');
+  if (r2.leg !== 2) throw new Error('Leg 2 vote failed');
+  console.log('  ✓ Leg 2 vote still allowed (independent of leg 1)');
 
   return debateId;
 }
 
 // ============================================================================
-// Phase E — Vote on uncompleted debate refused
+// Phase E — Vote on leg without evaluation refused
 // ============================================================================
 
 async function phaseE() {
-  console.log('\n=== PHASE E: Vote on uncompleted debate refused ===');
+  console.log('\n=== PHASE E: Vote on leg without evaluation refused ===');
 
   const [agentA, agentB] = await prisma.agent.findMany({ take: 2, orderBy: { id: 'asc' } });
 
@@ -270,20 +245,31 @@ async function phaseE() {
     data: {
       topic: `${TOPIC_PREFIX} phase-E-pending`,
       status: 'pending',
-      affAgentId: agentA.id,
-      negAgentId: agentB.id,
+      agentAId: agentA.id,
+      agentBId: agentB.id,
     },
   });
 
   let threw = false;
   try {
-    await applyHumanVote(debate.id, 'aff');
+    await recordHumanVote(debate.id, 1, 'aff');
   } catch (err) {
-    if (err.message.includes('no evaluation') || err.message.includes('status')) threw = true;
+    if (err.message.includes('No evaluation found')) threw = true;
     else throw err;
   }
-  if (!threw) throw new Error('Vote on pending debate should have been refused');
-  console.log('  ✓ Vote on pending debate refused');
+  if (!threw) throw new Error('Vote on debate without evaluations should have been refused');
+  console.log('  ✓ Vote on leg without evaluation refused');
+
+  // Invalid leg value
+  threw = false;
+  try {
+    await recordHumanVote(debate.id, 3, 'aff');
+  } catch (err) {
+    if (err.message.includes('leg must be')) threw = true;
+    else throw err;
+  }
+  if (!threw) throw new Error('Vote on leg=3 should have been refused');
+  console.log('  ✓ Invalid leg value refused');
 
   return debate.id;
 }
@@ -301,7 +287,6 @@ async function phaseE() {
   try {
     createdIds.push(await phaseA());
     createdIds.push(await phaseB());
-    await phaseC();   // restores between paths internally; no top-level id to push
     createdIds.push(await phaseD());
     createdIds.push(await phaseE());
 

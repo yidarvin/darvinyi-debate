@@ -1,13 +1,15 @@
-// Judge module. Evaluates a debate's six turns and produces a structured
+// Judge module. Evaluates ONE LEG of a two-leg match and produces a structured
 // verdict with per-axis scores + reasoning. Always uses Claude Opus 4.7 with
 // NO tools (pure text evaluation).
 //
-// Anonymization: judge sees only AFFIRMATIVE/NEGATIVE labels — never agent
-// names, ids, providers, or model strings. buildJudgePrompt (in
-// systemPrompts.js) enforces this; do not extend the prompt with identity.
+// Anonymization: judge sees only AFFIRMATIVE/NEGATIVE labels within this leg —
+// never agent names, ids, providers, or model strings. The judge does NOT know
+// that leg-2-AFF is the same agent as leg-1-NEG. buildJudgePrompt enforces this;
+// do not extend the prompt with identity or cross-leg references.
 //
-// On parse/validation failure, retries once with a clarifying message.
-// Second failure marks the debate `failed` and throws.
+// Does NOT touch debate.status — the SSE wrapper transitions status to
+// 'judging' before invoking, and to 'completed' after both legs are judged
+// and ELO is applied.
 
 import Anthropic from '@anthropic-ai/sdk';
 import { prisma } from '../db.js';
@@ -22,15 +24,20 @@ const VALID_WINNERS = new Set(['aff', 'neg', 'draw']);
 const SCORE_AXES = ['argument', 'evidence', 'responsiveness', 'persuasion'];
 
 /**
- * Evaluate a debate end-to-end.
+ * Evaluate a single leg of a debate.
  *
  * @param {object} params
  * @param {string} params.debateId
+ * @param {1 | 2} params.leg
  * @param {(event: object) => void | Promise<void>} params.onEvent - judge_thinking, judge_text_delta, evaluation_complete
  * @param {AbortSignal} [params.signal]
  * @returns {Promise<{evaluation: object}>} the saved Evaluation row
  */
-export async function judgeDebate({ debateId, onEvent, signal }) {
+export async function judgeLeg({ debateId, leg, onEvent, signal }) {
+  if (leg !== 1 && leg !== 2) {
+    throw new Error(`judgeLeg: leg must be 1 or 2 (got ${leg})`);
+  }
+
   const emit = async (event) => {
     try {
       await onEvent(event);
@@ -39,25 +46,31 @@ export async function judgeDebate({ debateId, onEvent, signal }) {
     }
   };
 
-  // Load debate + turns. Notably: NOT loading affAgent/negAgent here. The
+  // Load debate + this leg's turns. Notably: NOT loading agentA/agentB. The
   // judge has no business knowing identities.
   const debate = await prisma.debate.findUnique({
     where: { id: debateId },
-    include: { turns: { orderBy: { roundNumber: 'asc' } } },
+    include: {
+      turns: {
+        where: { leg },
+        orderBy: { roundNumber: 'asc' },
+      },
+      evaluations: { where: { leg }, select: { id: true } },
+    },
   });
 
   if (!debate) {
     throw new Error(`Debate not found: ${debateId}`);
   }
-  if (debate.status === 'completed') {
-    throw new Error(`Debate ${debateId} is already completed; refusing to re-judge`);
+  if (debate.evaluations.length > 0) {
+    throw new Error(`Debate ${debateId} leg ${leg} already has an evaluation; refusing to re-judge`);
   }
   if (debate.turns.length !== 6) {
-    throw new Error(`Cannot judge: expected 6 turns, got ${debate.turns.length}`);
+    throw new Error(`Cannot judge leg ${leg}: expected 6 turns, got ${debate.turns.length}`);
   }
   for (let i = 0; i < 6; i++) {
     if (debate.turns[i].roundNumber !== i + 1) {
-      throw new Error(`Turn at index ${i} has roundNumber ${debate.turns[i].roundNumber}`);
+      throw new Error(`Leg ${leg} turn at index ${i} has roundNumber ${debate.turns[i].roundNumber}`);
     }
   }
 
@@ -75,11 +88,10 @@ export async function judgeDebate({ debateId, onEvent, signal }) {
     })),
   });
 
-  await emit({ type: 'judge_thinking' });
+  await emit({ type: 'judge_thinking', leg });
 
   const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-  // First-attempt messages; mutated on retry to append the model's bad reply + a corrective user msg.
   const messages = [{ role: 'user', content: judgePrompt }];
 
   let parsed = null;
@@ -109,10 +121,8 @@ export async function judgeDebate({ debateId, onEvent, signal }) {
         ) {
           const delta = event.delta.text;
           fullResponse += delta;
-          // Only stream judge text on the first attempt — a retry response
-          // overlaid on the same UI would be confusing.
           if (attempt === 0) {
-            await emit({ type: 'judge_text_delta', text: delta });
+            await emit({ type: 'judge_text_delta', leg, text: delta });
           }
         }
       }
@@ -123,7 +133,6 @@ export async function judgeDebate({ debateId, onEvent, signal }) {
         await markFailed(debateId, `Judge aborted: ${err.message ?? ''}`.trim());
         throw err;
       }
-      // Non-abort error during streaming. If first attempt, fall through to retry.
       if (attempt === 0) {
         lastError = err;
         messages.push({ role: 'assistant', content: fullResponse || '(empty)' });
@@ -148,7 +157,7 @@ export async function judgeDebate({ debateId, onEvent, signal }) {
     lastError = new Error(parseResult.error);
 
     if (attempt === 0) {
-      console.warn(`[judge] Attempt 1 parse failed: ${parseResult.error}. Retrying.`);
+      console.warn(`[judge] Leg ${leg} attempt 1 parse failed: ${parseResult.error}. Retrying.`);
       messages.push({ role: 'assistant', content: fullResponse });
       messages.push({
         role: 'user',
@@ -158,58 +167,42 @@ export async function judgeDebate({ debateId, onEvent, signal }) {
       continue;
     }
 
-    // Second attempt also failed.
-    await markFailed(debateId, `Judge produced unparseable output after retry: ${parseResult.error}`);
+    await markFailed(debateId, `Judge produced unparseable output for leg ${leg} after retry: ${parseResult.error}`);
     throw new Error(`Judge produced unparseable output after retry: ${parseResult.error}`);
   }
 
   if (!parsed) {
-    // Defensive — shouldn't reach here.
     await markFailed(debateId, `Judge: no parsed output (last error: ${lastError?.message})`);
     throw new Error(`Judge: no parsed output (last error: ${lastError?.message})`);
   }
 
-  // Clamp out-of-range scores defensively.
   const clamped = clampScores(parsed);
-
   const affTotal = sumScores(clamped.aff_scores);
   const negTotal = sumScores(clamped.neg_scores);
 
-  // Persist evaluation + flip debate to completed, atomically.
-  const saved = await prisma.$transaction(async (tx) => {
-    const evaluation = await tx.evaluation.create({
-      data: {
-        debateId,
-        winner: clamped.winner,
-        affArgument: clamped.aff_scores.argument,
-        affEvidence: clamped.aff_scores.evidence,
-        affResponsive: clamped.aff_scores.responsiveness,
-        affPersuasion: clamped.aff_scores.persuasion,
-        affTotal,
-        negArgument: clamped.neg_scores.argument,
-        negEvidence: clamped.neg_scores.evidence,
-        negResponsive: clamped.neg_scores.responsiveness,
-        negPersuasion: clamped.neg_scores.persuasion,
-        negTotal,
-        reasoning: clamped.reasoning,
-        judgeModel: JUDGE_MODEL,
-      },
-    });
-
-    await tx.debate.update({
-      where: { id: debateId },
-      data: {
-        winner: clamped.winner,
-        status: 'completed',
-        completedAt: new Date(),
-      },
-    });
-
-    return evaluation;
+  const saved = await prisma.evaluation.create({
+    data: {
+      debateId,
+      leg,
+      winner: clamped.winner,
+      affArgument: clamped.aff_scores.argument,
+      affEvidence: clamped.aff_scores.evidence,
+      affResponsive: clamped.aff_scores.responsiveness,
+      affPersuasion: clamped.aff_scores.persuasion,
+      affTotal,
+      negArgument: clamped.neg_scores.argument,
+      negEvidence: clamped.neg_scores.evidence,
+      negResponsive: clamped.neg_scores.responsiveness,
+      negPersuasion: clamped.neg_scores.persuasion,
+      negTotal,
+      reasoning: clamped.reasoning,
+      judgeModel: JUDGE_MODEL,
+    },
   });
 
   await emit({
     type: 'evaluation_complete',
+    leg,
     winner: clamped.winner,
     affScores: {
       argument: clamped.aff_scores.argument,
@@ -243,10 +236,8 @@ function tryParseJudgeOutput(raw) {
 
   let cleaned = raw.trim();
 
-  // Strip markdown code fences if present (despite instructions, models sometimes wrap).
   cleaned = cleaned.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?\s*```\s*$/i, '').trim();
 
-  // If the model wrote prose before the JSON, try to locate the first { and last }.
   if (!cleaned.startsWith('{')) {
     const firstBrace = cleaned.indexOf('{');
     const lastBrace = cleaned.lastIndexOf('}');

@@ -1,7 +1,10 @@
 // Selects two distinct agents uniformly at random from the roster.
-// Then assigns affirmative/negative randomly.
 //
-// Returns: { affAgent, negAgent } — two distinct Agent rows from the DB.
+// Returns: { agentA, agentB } — two distinct Agent rows from the DB.
+//
+// In leg 1 of the resulting match, agent A takes affirmative and agent B takes
+// negative; in leg 2 they swap. The A/B labels are arbitrary — the assignment
+// is uniform random, so no side-bias exists in the data.
 
 import { prisma } from '../db.js';
 
@@ -21,13 +24,5 @@ export async function pickRandomAgents() {
     [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
   }
 
-  const first = shuffled[0];
-  const second = shuffled[1];
-
-  // Coin flip for side assignment.
-  const affFirst = Math.random() < 0.5;
-  return {
-    affAgent: affFirst ? first : second,
-    negAgent: affFirst ? second : first,
-  };
+  return { agentA: shuffled[0], agentB: shuffled[1] };
 }

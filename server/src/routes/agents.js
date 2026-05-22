@@ -1,9 +1,12 @@
 // /api/agents — public read endpoints for agents.
 //
 // GET /             — leaderboard (all agents, sorted by ELO desc)
-// GET /:id          — agent profile (stats + recent debates + ELO trajectory)
+// GET /:id          — agent profile (stats + recent matches + ELO trajectory)
 //
 // No auth, no rate limit. Cacheable at the CDN layer if added later.
+//
+// Recent debates and ELO history are per-MATCH, not per-leg. The match-level
+// outcome ('A' | 'B' | 'draw' on Debate.winner) drives the win/loss/draw labels.
 
 import { Router } from 'express';
 import { prisma } from '../db.js';
@@ -13,16 +16,6 @@ const router = Router();
 const ELO_HISTORY_LIMIT = 50;
 const RECENT_DEBATES_LIMIT = 20;
 
-/**
- * GET /api/agents
- * Returns: Array<AgentSummary>
- *
- * AgentSummary = {
- *   id, displayName, provider, modelId,
- *   elo, wins, losses, draws, totalDebates,
- *   createdAt (ISO)
- * }
- */
 router.get('/', async (req, res, next) => {
   try {
     const agents = await prisma.agent.findMany({
@@ -50,15 +43,11 @@ router.get('/', async (req, res, next) => {
 
 /**
  * GET /api/agents/:id
- * Returns: { agent, recentDebates, eloHistory }
+ * Returns: { agent, recentDebates, eloHistory, humanVoteStats }
  *
- * recentDebates is from this agent's POV: `side` is 'aff' or 'neg' for this
- * agent, `opponent` is the other agent's {id, displayName}, and `result` is
- * 'win' | 'loss' | 'draw' from this agent's POV (not the global winner).
- *
- * eloHistory is returned in chronological order (oldest first) so the frontend
- * can render a line chart directly without reversing. Limited to the last 50
- * changes.
+ * recentDebates: one row per match this agent participated in. role is 'A' or 'B'
+ * (which side of the match they were assigned), opponent is the other agent,
+ * result is 'win' | 'loss' | 'draw' derived from debate.winner.
  */
 router.get('/:id', async (req, res, next) => {
   try {
@@ -69,40 +58,46 @@ router.get('/:id', async (req, res, next) => {
       return res.status(404).json({ error: 'Agent not found' });
     }
 
-    // Recent completed debates from this agent's POV.
     const debates = await prisma.debate.findMany({
       where: {
         status: 'completed',
-        OR: [{ affAgentId: id }, { negAgentId: id }],
+        OR: [{ agentAId: id }, { agentBId: id }],
       },
       include: {
-        affAgent: { select: { id: true, displayName: true } },
-        negAgent: { select: { id: true, displayName: true } },
+        agentA: { select: { id: true, displayName: true } },
+        agentB: { select: { id: true, displayName: true } },
+        evaluations: { select: { humanAgreedWithJudge: true, humanWinner: true } },
+        eloChanges: { where: { agentId: id }, select: { before: true, after: true, delta: true } },
       },
       orderBy: { completedAt: 'desc' },
       take: RECENT_DEBATES_LIMIT,
     });
 
     const recentDebates = debates.map((d) => {
-      const isAff = d.affAgentId === id;
-      const side = isAff ? 'aff' : 'neg';
-      const opponent = isAff ? d.negAgent : d.affAgent;
+      const isA = d.agentAId === id;
+      const role = isA ? 'A' : 'B';
+      const opponent = isA ? d.agentB : d.agentA;
       let result;
       if (d.winner === 'draw') result = 'draw';
-      else if (d.winner === side) result = 'win';
+      else if (d.winner === role) result = 'win';
       else result = 'loss';
+
+      const eloChange = d.eloChanges[0] ?? null;
 
       return {
         id: d.id,
         topic: d.topic,
-        side,
+        role,
         opponent: { id: opponent.id, displayName: opponent.displayName },
         result,
         completedAt: d.completedAt ? d.completedAt.toISOString() : null,
+        elo: eloChange
+          ? { before: eloChange.before, after: eloChange.after, delta: eloChange.delta }
+          : null,
       };
     });
 
-    // ELO trajectory — most recent N changes, then reversed for chronological display.
+    // ELO trajectory — one entry per match (debate). Sorted oldest first for charting.
     const recentChanges = await prisma.eloChange.findMany({
       where: { agentId: id },
       orderBy: { createdAt: 'desc' },
@@ -118,27 +113,26 @@ router.get('/:id', async (req, res, next) => {
         createdAt: c.createdAt.toISOString(),
       }));
 
-    // Human vote stats: how many of this agent's debates have human votes?
-    // And of those, how many had the judge overridden?
+    // Human vote stats: count of MATCHES this agent participated in where at
+    // least one leg has a human vote, and how many of those had at least one
+    // leg's humanAgreedWithJudge === false.
     const debatesWithVotes = await prisma.debate.findMany({
       where: {
-        OR: [{ affAgentId: id }, { negAgentId: id }],
-        evaluation: { humanWinner: { not: null } },
+        OR: [{ agentAId: id }, { agentBId: id }],
+        evaluations: { some: { humanWinner: { not: null } } },
       },
       include: {
-        evaluation: { select: { humanAgreedWithJudge: true } },
+        evaluations: {
+          where: { humanWinner: { not: null } },
+          select: { humanAgreedWithJudge: true },
+        },
       },
     });
 
     const totalHumanVotes = debatesWithVotes.length;
-    const judgeOverridden = debatesWithVotes.filter(
-      (d) => d.evaluation?.humanAgreedWithJudge === false,
+    const judgeOverridden = debatesWithVotes.filter((d) =>
+      d.evaluations.some((e) => e.humanAgreedWithJudge === false),
     ).length;
-
-    const humanVoteStats = {
-      totalVotes: totalHumanVotes,
-      judgeOverridden,
-    };
 
     res.json({
       agent: {
@@ -155,7 +149,10 @@ router.get('/:id', async (req, res, next) => {
       },
       recentDebates,
       eloHistory,
-      humanVoteStats,
+      humanVoteStats: {
+        totalVotes: totalHumanVotes,
+        judgeOverridden,
+      },
     });
   } catch (err) {
     next(err);
