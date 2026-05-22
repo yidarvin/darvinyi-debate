@@ -20,6 +20,7 @@ import { prisma } from '../db.js';
 import { pickRandomAgents } from '../orchestrator/pickAgents.js';
 import { runDebate } from '../orchestrator/runDebate.js';
 import { judgeDebate } from '../judge/judgeDebate.js';
+import { applyEloChange } from '../elo/applyEloChange.js';
 
 const router = Router();
 
@@ -381,6 +382,40 @@ router.get('/:id/stream', async (req, res) => {
 
       const evaluation = evaluationResult?.evaluation;
 
+      // Apply ELO. Non-fatal on failure — the judge succeeded and the
+      // verdict stands; the ratings can be backfilled by running
+      // applyEloChange(debateId) manually if needed.
+      let eloResult = null;
+      if (evaluation) {
+        try {
+          eloResult = await applyEloChange(id);
+        } catch (err) {
+          console.error('[stream] applyEloChange failed for', id, ':', err);
+          send('error', { message: `ELO update failed: ${err.message ?? 'unknown'} (verdict stands; leaderboard may be temporarily out of sync)` });
+        }
+      }
+
+      const eloChangesPayload = eloResult
+        ? [
+            {
+              agentId: eloResult.aff.agentId,
+              before: eloResult.aff.before,
+              after: eloResult.aff.after,
+              delta: eloResult.aff.delta,
+            },
+            {
+              agentId: eloResult.neg.agentId,
+              before: eloResult.neg.before,
+              after: eloResult.neg.after,
+              delta: eloResult.neg.delta,
+            },
+          ]
+        : [];
+
+      if (eloResult) {
+        send('elo_updated', { changes: eloChangesPayload });
+      }
+
       send('debate_complete', {
         debateId: id,
         topic: debate.topic,
@@ -408,7 +443,7 @@ router.get('/:id/stream', async (req, res) => {
               judgeModel: evaluation.judgeModel,
             }
           : null,
-        eloChanges: [], // populated in Prompt 14
+        eloChanges: eloChangesPayload,
       });
     }
 

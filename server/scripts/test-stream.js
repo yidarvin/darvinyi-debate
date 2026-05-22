@@ -20,6 +20,27 @@ const KEYPHRASE = process.env.DEBATE_KEYPHRASE;
 const TEST_TOPIC =
   'TEST DEBATE — SSE stream end-to-end. A four-day workweek would improve overall economic productivity in developed nations.';
 
+// ----------------------------------------------------------------------------
+// Snapshot/restore agent stats so test runs are non-destructive. The full
+// stream test ends with the judge + ELO firing, which permanently mutates
+// agent.elo and win/loss/draw counters. We snapshot before and restore after.
+// ----------------------------------------------------------------------------
+
+async function snapshotAllAgents() {
+  return prisma.agent.findMany({
+    select: { id: true, elo: true, wins: true, losses: true, draws: true },
+  });
+}
+
+async function restoreAllAgents(snapshot) {
+  for (const a of snapshot) {
+    await prisma.agent.update({
+      where: { id: a.id },
+      data: { elo: a.elo, wins: a.wins, losses: a.losses, draws: a.draws },
+    });
+  }
+}
+
 if (!KEYPHRASE || KEYPHRASE === 'change_me_before_deploying') {
   console.error('DEBATE_KEYPHRASE must be set to a real value in /server/.env');
   process.exit(1);
@@ -279,7 +300,11 @@ async function cleanup() {
 
 (async () => {
   let debateId = null;
+  let agentSnapshot = null;
   try {
+    agentSnapshot = await snapshotAllAgents();
+    console.log(`Snapshotted ${agentSnapshot.length} agents for non-destructive testing.`);
+
     await preflightAuth();
     debateId = await endToEndStream();
     if (debateId) await replayCompleted(debateId);
@@ -289,6 +314,10 @@ async function cleanup() {
     process.exitCode = 1;
   } finally {
     await cleanup();
+    if (agentSnapshot) {
+      await restoreAllAgents(agentSnapshot);
+      console.log(`Restored agent state for ${agentSnapshot.length} agents.`);
+    }
     await prisma.$disconnect();
   }
 })();
