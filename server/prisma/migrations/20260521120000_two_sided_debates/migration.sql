@@ -1,3 +1,10 @@
+-- Schema reshape: legacy single-leg debates cannot be backfilled into the
+-- two-leg model. Clear debate data and reset Agent leaderboard stats so
+-- displayed wins/losses/draws/elo stay consistent with the (now empty)
+-- match history. DebateTurn, Evaluation, and EloChange cascade from Debate.
+DELETE FROM "Debate";
+UPDATE "Agent" SET "wins" = 0, "losses" = 0, "draws" = 0, "elo" = 1200;
+
 -- DropForeignKey
 ALTER TABLE "Debate" DROP CONSTRAINT "Debate_affAgentId_fkey";
 
