@@ -140,10 +140,10 @@ function RecentDebatesSection({ state }) {
 
 function DebateCard({ debate }) {
   const winnerLabel =
-    debate.winner === 'aff'
-      ? debate.affAgent?.displayName
-      : debate.winner === 'neg'
-      ? debate.negAgent?.displayName
+    debate.winner === 'A'
+      ? debate.agentA?.displayName
+      : debate.winner === 'B'
+      ? debate.agentB?.displayName
       : debate.winner === 'draw'
       ? 'Draw'
       : null;
@@ -158,9 +158,9 @@ function DebateCard({ debate }) {
       </p>
       <div className="flex items-center justify-between gap-4 text-xs font-mono">
         <span className="text-text-muted truncate">
-          {debate.affAgent?.displayName ?? '?'}{' '}
+          {debate.agentA?.displayName ?? '?'}{' '}
           <span className="text-text-muted/60">vs</span>{' '}
-          {debate.negAgent?.displayName ?? '?'}
+          {debate.agentB?.displayName ?? '?'}
         </span>
         {winnerLabel && (
           <span className="text-accent whitespace-nowrap">→ {winnerLabel}</span>

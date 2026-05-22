@@ -214,10 +214,10 @@ function PageHeader({ rerunOf, rerunSource, loadingRerun, rerunError }) {
                 <p className="font-mono text-xs text-text-dim mb-1.5">
                   Previous verdict:{' '}
                   <span className="text-text">
-                    {rerunSource.winner === 'aff'
-                      ? rerunSource.affAgent?.displayName ?? 'Affirmative'
-                      : rerunSource.winner === 'neg'
-                      ? rerunSource.negAgent?.displayName ?? 'Negative'
+                    {rerunSource.winner === 'A'
+                      ? rerunSource.agentA?.displayName ?? 'Agent A'
+                      : rerunSource.winner === 'B'
+                      ? rerunSource.agentB?.displayName ?? 'Agent B'
                       : rerunSource.winner === 'draw'
                       ? 'Draw'
                       : 'Unresolved'}
@@ -396,7 +396,8 @@ function SubmitSection({ canSubmit, submitting, rerunOf }) {
         )}
       </button>
       <p className="font-mono text-xs text-text-muted text-center leading-relaxed">
-        A full debate takes 2–4 minutes and uses approximately $1–$3 in API credits.
+        A match runs as two debates with the agents swapping sides. Total time: roughly 6–12
+        minutes. Cost: roughly $3–6 in API credits. Limit: 3 matches per 24 hours.
         <br />
         You'll be redirected to the live viewer.
       </p>

@@ -328,17 +328,15 @@ function RecentDebatesSection({ recentDebates, deltaByDebateId }) {
 }
 
 function RecentDebateRow({ debate, delta }) {
-  const sideTokens =
-    debate.side === 'aff'
-      ? { color: 'text-side-aff', label: 'AFF' }
-      : { color: 'text-side-neg', label: 'NEG' };
+  const roleLabel = debate.role === 'A' ? 'Agent A' : 'Agent B';
+  const roleColor = debate.role === 'A' ? 'text-accent' : 'text-side-neg';
 
   const resultTokens =
     debate.result === 'win'
       ? { color: 'text-accent', label: 'Won' }
       : debate.result === 'loss'
       ? { color: 'text-red-400', label: 'Lost' }
-      : { color: 'text-text-dim', label: 'Draw' };
+      : { color: 'text-text-dim', label: 'Drew' };
 
   const hasDelta = typeof delta === 'number' && !Number.isNaN(delta);
   const deltaRounded = hasDelta ? Math.round(delta) : null;
@@ -363,10 +361,9 @@ function RecentDebateRow({ debate, delta }) {
         {debate.topic}
       </p>
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 text-xs font-mono">
-        <span className={sideTokens.color}>{sideTokens.label}</span>
-        <Bullet />
         <span className="text-text-muted">
-          vs <span className="text-text-dim">{opponent}</span>
+          As <span className={roleColor}>{roleLabel}</span> vs{' '}
+          <span className="text-text-dim">{opponent}</span>
         </span>
         <Bullet />
         <span className={resultTokens.color}>{resultTokens.label}</span>

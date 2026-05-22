@@ -153,26 +153,26 @@ function PageHeader({ debateCount, hasMore, loading }) {
 // ============================================================================
 
 function DebateRow({ debate }) {
-  const aff = debate.affAgent?.displayName ?? '?';
-  const neg = debate.negAgent?.displayName ?? '?';
+  const aName = debate.agentA?.displayName ?? '?';
+  const bName = debate.agentB?.displayName ?? '?';
 
   let verdictNode = null;
-  if (debate.winner === 'aff') {
+  if (debate.winner === 'A') {
     verdictNode = (
-      <span className="text-side-aff">
-        AFF won <span className="text-side-aff/60">— {aff}</span>
+      <span className="text-accent">
+        Agent A won <span className="text-accent/60">— {aName}</span>
       </span>
     );
-  } else if (debate.winner === 'neg') {
+  } else if (debate.winner === 'B') {
     verdictNode = (
       <span className="text-side-neg">
-        NEG won <span className="text-side-neg/60">— {neg}</span>
+        Agent B won <span className="text-side-neg/60">— {bName}</span>
       </span>
     );
   } else if (debate.winner === 'draw') {
     verdictNode = <span className="text-text-dim">Draw</span>;
   } else {
-    verdictNode = <span className="text-text-muted">Unresolved</span>;
+    verdictNode = null;
   }
 
   return (
@@ -185,10 +185,14 @@ function DebateRow({ debate }) {
       </p>
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 text-xs font-mono">
         <span className="text-text-muted truncate">
-          {aff} <span className="text-text-muted/50">vs</span> {neg}
+          {aName} <span className="text-text-muted/50">vs</span> {bName}
         </span>
-        <Bullet />
-        {verdictNode}
+        {verdictNode && (
+          <>
+            <Bullet />
+            {verdictNode}
+          </>
+        )}
         <Bullet />
         <time className="text-text-muted whitespace-nowrap" dateTime={debate.completedAt ?? undefined}>
           {formatTimestamp(debate.completedAt)}
