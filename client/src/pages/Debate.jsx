@@ -1,6 +1,27 @@
-import { useEffect, useMemo, useReducer, useRef } from 'react';
+import { useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { debateStreamUrl } from '../api.js';
+import { ApiError, debateStreamUrl, fetchJson } from '../api.js';
+
+// Same key as NewDebate.jsx so keyphrase set on /new carries through to voting.
+const KEYPHRASE_STORAGE_KEY = 'debate_arena_keyphrase';
+
+function readStoredKeyphrase() {
+  if (typeof window === 'undefined') return '';
+  try {
+    return localStorage.getItem(KEYPHRASE_STORAGE_KEY) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+function storeKeyphrase(value) {
+  if (typeof window === 'undefined') return;
+  try {
+    localStorage.setItem(KEYPHRASE_STORAGE_KEY, value);
+  } catch {
+    // localStorage disabled — silent fail
+  }
+}
 
 // ============================================================================
 // Constants
@@ -155,6 +176,19 @@ function reducer(state, action) {
 
     case 'debate_complete': {
       const { affAgent, negAgent, winner, evaluation, eloChanges, topic } = action.payload;
+
+      // Merge human vote fields from the server's evaluation payload into the
+      // existing in-memory evaluation (built by evaluation_complete on live).
+      // On replay, state.evaluation may still be null until this event arrives.
+      const mergedEvaluation = state.evaluation
+        ? {
+            ...state.evaluation,
+            humanWinner: evaluation?.humanWinner ?? null,
+            humanAgreedWithJudge: evaluation?.humanAgreedWithJudge ?? null,
+            humanVotedAt: evaluation?.humanVotedAt ?? null,
+          }
+        : evaluation ?? null;
+
       return {
         ...state,
         phase: 'complete',
@@ -163,10 +197,26 @@ function reducer(state, action) {
         reveal: true,
         winner: winner ?? state.winner,
         topic: state.topic ?? topic,
-        // Backfill evaluation/eloChanges if we didn't get the dedicated events
-        // (e.g. server-side replay of a completed debate that didn't fire them).
-        evaluation: state.evaluation ?? evaluation ?? null,
+        evaluation: mergedEvaluation,
         eloChanges: state.eloChanges.length > 0 ? state.eloChanges : (eloChanges ?? []),
+      };
+    }
+
+    case 'vote_recorded': {
+      // Local action dispatched after a successful POST /:id/vote.
+      const { agreed, humanWinner, finalWinner, eloChanges } = action.payload;
+      return {
+        ...state,
+        winner: finalWinner,
+        evaluation: state.evaluation
+          ? {
+              ...state.evaluation,
+              humanWinner,
+              humanAgreedWithJudge: agreed,
+              humanVotedAt: new Date().toISOString(),
+            }
+          : state.evaluation,
+        eloChanges: eloChanges ?? state.eloChanges,
       };
     }
 
@@ -343,6 +393,10 @@ export default function Debate() {
           </p>
           <p className="font-body text-sm text-red-400/90">{state.streamError}</p>
         </div>
+      )}
+
+      {state.phase === 'complete' && state.evaluation && (
+        <VoteSection debateId={id} state={state} dispatch={dispatch} />
       )}
 
       {state.phase === 'complete' && <ReRunFooter debateId={id} />}
@@ -661,5 +715,241 @@ function ReRunFooter({ debateId }) {
         <span aria-hidden="true">→</span>
       </Link>
     </div>
+  );
+}
+
+// ============================================================================
+// Vote section — appears below the verdict, after debate_complete
+// ============================================================================
+
+function VoteSection({ debateId, state, dispatch }) {
+  const judgeWinner = state.evaluation.winner;
+  const humanWinner = state.evaluation.humanWinner ?? null;
+  const agreed = state.evaluation.humanAgreedWithJudge;
+
+  // If a human vote already exists (set by reducer after vote or arrived on replay),
+  // show the confirmation card. Otherwise show the vote panel.
+  if (humanWinner) {
+    return <VotedCard humanWinner={humanWinner} judgeWinner={judgeWinner} agreed={agreed} />;
+  }
+
+  return <VotePanel debateId={debateId} judgeWinner={judgeWinner} dispatch={dispatch} />;
+}
+
+// ----------------------------------------------------------------------------
+// Vote panel (pre-vote)
+// ----------------------------------------------------------------------------
+
+function VotePanel({ debateId, judgeWinner, dispatch }) {
+  const [keyphrase, setKeyphrase] = useState(readStoredKeyphrase);
+  const [submitting, setSubmitting] = useState(null); // 'aff' | 'neg' | 'draw' | null
+  const [error, setError] = useState(null);
+
+  const needsKeyphraseInput = !readStoredKeyphrase();
+
+  const handleVote = async (winner) => {
+    if (submitting) return;
+
+    const trimmedKey = keyphrase.trim();
+    if (!trimmedKey) {
+      setError('Enter your keyphrase first.');
+      return;
+    }
+
+    setSubmitting(winner);
+    setError(null);
+
+    try {
+      const result = await fetchJson(`/debates/${encodeURIComponent(debateId)}/vote`, {
+        method: 'POST',
+        body: { winner },
+        headers: { 'X-Debate-Key': trimmedKey },
+      });
+
+      storeKeyphrase(trimmedKey);
+      dispatch({ type: 'vote_recorded', payload: result });
+    } catch (err) {
+      setSubmitting(null);
+      if (err instanceof ApiError) {
+        if (err.status === 401) {
+          setError('Invalid keyphrase.');
+        } else if (err.status === 409) {
+          setError('This debate already has a recorded vote.');
+        } else if (err.status === 429) {
+          setError(err.message || 'Rate limit reached. Try again in a few hours.');
+        } else if (err.status === 400) {
+          setError(err.message || 'Invalid request.');
+        } else {
+          setError(err.message || 'Vote failed.');
+        }
+      } else {
+        setError(err.message || 'Network error.');
+      }
+    }
+  };
+
+  return (
+    <section className="mt-12 border-t border-bg-border pt-10">
+      <h2 className="font-display text-display-md text-text mb-3">Your call?</h2>
+      <p className="font-body text-text-dim mb-8 max-w-reading leading-relaxed">
+        The judge has weighed in above. Do you agree, or do you see it differently? If you
+        override, the ELO will be recalculated based on your verdict. One vote per debate.
+      </p>
+
+      {needsKeyphraseInput && (
+        <div className="mb-6">
+          <label htmlFor="vote-keyphrase" className="font-mono text-xs text-text-muted block mb-2 uppercase tracking-wider">
+            Keyphrase
+          </label>
+          <input
+            id="vote-keyphrase"
+            type="password"
+            value={keyphrase}
+            onChange={(e) => setKeyphrase(e.target.value)}
+            autoComplete="off"
+            spellCheck={false}
+            placeholder="••••••••"
+            disabled={!!submitting}
+            className="w-full max-w-xs bg-bg-elevated border border-bg-border rounded-md p-2.5 font-mono text-sm text-text placeholder:text-text-muted focus:border-accent focus:outline-none transition-colors disabled:opacity-60"
+          />
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        <VoteButton
+          side="aff"
+          label="AFF wins"
+          isJudgePick={judgeWinner === 'aff'}
+          onClick={() => handleVote('aff')}
+          submitting={submitting}
+        />
+        <VoteButton
+          side="draw"
+          label="Draw"
+          isJudgePick={judgeWinner === 'draw'}
+          onClick={() => handleVote('draw')}
+          submitting={submitting}
+        />
+        <VoteButton
+          side="neg"
+          label="NEG wins"
+          isJudgePick={judgeWinner === 'neg'}
+          onClick={() => handleVote('neg')}
+          submitting={submitting}
+        />
+      </div>
+
+      {error && (
+        <p role="alert" className="font-mono text-sm text-red-400 mt-4">
+          {error}
+        </p>
+      )}
+    </section>
+  );
+}
+
+function VoteButton({ side, label, isJudgePick, onClick, submitting }) {
+  const sideTokens =
+    side === 'aff'
+      ? {
+          border: 'border-side-aff/30',
+          hoverBorder: 'hover:border-side-aff',
+          hoverBg: 'hover:bg-side-aff/5',
+          text: 'text-side-aff',
+        }
+      : side === 'neg'
+      ? {
+          border: 'border-side-neg/30',
+          hoverBorder: 'hover:border-side-neg',
+          hoverBg: 'hover:bg-side-neg/5',
+          text: 'text-side-neg',
+        }
+      : {
+          border: 'border-bg-border',
+          hoverBorder: 'hover:border-text-dim',
+          hoverBg: 'hover:bg-bg-elevated',
+          text: 'text-text-dim',
+        };
+
+  const isSubmittingThis = submitting === side;
+  const isSubmittingOther = submitting !== null && submitting !== side;
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={!!submitting}
+      className={[
+        'relative card p-5 transition-all text-center',
+        sideTokens.border,
+        !submitting && sideTokens.hoverBorder,
+        !submitting && sideTokens.hoverBg,
+        isSubmittingOther && 'opacity-30',
+        submitting && 'cursor-not-allowed',
+      ]
+        .filter(Boolean)
+        .join(' ')}
+    >
+      <span className={`font-display text-lg ${sideTokens.text}`}>
+        {isSubmittingThis ? (
+          <span className="inline-flex items-center justify-center gap-2">
+            <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />
+            <span className="opacity-70">Voting…</span>
+          </span>
+        ) : (
+          label
+        )}
+      </span>
+      {isJudgePick && (
+        <span className="absolute top-2 right-2 font-mono text-[10px] text-accent uppercase tracking-wider">
+          judge
+        </span>
+      )}
+    </button>
+  );
+}
+
+// ----------------------------------------------------------------------------
+// Voted card (post-vote OR replay of voted debate)
+// ----------------------------------------------------------------------------
+
+function VotedCard({ humanWinner, judgeWinner, agreed }) {
+  const labelFor = (w) =>
+    w === 'aff' ? 'Affirmative' : w === 'neg' ? 'Negative' : w === 'draw' ? 'Draw' : '—';
+
+  const borderClass = agreed ? 'border-l-accent' : 'border-l-amber-500';
+
+  return (
+    <section className="mt-12 border-t border-bg-border pt-10">
+      <h2 className="font-display text-display-md text-text mb-6">Your verdict</h2>
+
+      <div className={`card border-l-4 ${borderClass} p-5 md:p-6`}>
+        {agreed ? (
+          <>
+            <p className="font-mono text-xs text-accent uppercase tracking-wider mb-3">
+              Agreed with judge
+            </p>
+            <p className="font-body text-text-dim leading-relaxed">
+              You and the judge both called this for{' '}
+              <strong className="text-text font-medium">{labelFor(humanWinner)}</strong>.
+              The verdict stands; no ELO changes.
+            </p>
+          </>
+        ) : (
+          <>
+            <p className="font-mono text-xs text-amber-400 uppercase tracking-wider mb-3">
+              Overrode the judge
+            </p>
+            <p className="font-body text-text-dim leading-relaxed">
+              The judge called it for{' '}
+              <strong className="text-text font-medium">{labelFor(judgeWinner)}</strong>,
+              but you ruled{' '}
+              <strong className="text-text font-medium">{labelFor(humanWinner)}</strong>.
+              ELO has been recalculated based on your verdict.
+            </p>
+          </>
+        )}
+      </div>
+    </section>
   );
 }
