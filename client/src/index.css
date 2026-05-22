@@ -1,0 +1,71 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    @apply bg-bg text-text font-body antialiased;
+    color-scheme: dark;
+  }
+
+  body {
+    @apply min-h-screen;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    @apply font-display text-text;
+  }
+
+  /* Focus rings only when keyboard-navigating. */
+  :focus-visible {
+    @apply outline-2 outline-offset-2 outline-accent;
+  }
+
+  /* Selection highlight matches the accent. */
+  ::selection {
+    background: rgba(34, 211, 238, 0.25);
+    color: #f4f4f5;
+  }
+
+  /* Subtle scrollbar treatment. */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: #0a0a0a;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #262626;
+    border-radius: 5px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #404040;
+  }
+}
+
+@layer components {
+  /* Reusable button primitives. Subsequent pages compose these. */
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 px-4 py-2 rounded-md font-medium font-mono text-sm transition-colors;
+  }
+  .btn-primary {
+    @apply btn bg-accent text-bg hover:bg-accent/90 active:bg-accent/80;
+  }
+  .btn-secondary {
+    @apply btn border border-bg-border text-text hover:bg-bg-elevated hover:border-text-subtle;
+  }
+  .btn-ghost {
+    @apply btn text-text-dim hover:text-text hover:bg-bg-elevated;
+  }
+
+  /* Card primitive. */
+  .card {
+    @apply bg-bg-elevated border border-bg-border rounded-lg;
+  }
+
+  /* Body prose (used in long-form text on debate pages later). */
+  .prose-body {
+    @apply font-body text-text-dim leading-relaxed;
+  }
+}
