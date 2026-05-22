@@ -118,6 +118,28 @@ router.get('/:id', async (req, res, next) => {
         createdAt: c.createdAt.toISOString(),
       }));
 
+    // Human vote stats: how many of this agent's debates have human votes?
+    // And of those, how many had the judge overridden?
+    const debatesWithVotes = await prisma.debate.findMany({
+      where: {
+        OR: [{ affAgentId: id }, { negAgentId: id }],
+        evaluation: { humanWinner: { not: null } },
+      },
+      include: {
+        evaluation: { select: { humanAgreedWithJudge: true } },
+      },
+    });
+
+    const totalHumanVotes = debatesWithVotes.length;
+    const judgeOverridden = debatesWithVotes.filter(
+      (d) => d.evaluation?.humanAgreedWithJudge === false,
+    ).length;
+
+    const humanVoteStats = {
+      totalVotes: totalHumanVotes,
+      judgeOverridden,
+    };
+
     res.json({
       agent: {
         id: agent.id,
@@ -133,6 +155,7 @@ router.get('/:id', async (req, res, next) => {
       },
       recentDebates,
       eloHistory,
+      humanVoteStats,
     });
   } catch (err) {
     next(err);

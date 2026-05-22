@@ -8,6 +8,7 @@ import { fetchJson } from '../api.js';
 
 export default function Leaderboard() {
   const [state, setState] = useState({ data: null, error: null });
+  const [judgeStats, setJudgeStats] = useState(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -20,6 +21,15 @@ export default function Leaderboard() {
       .catch((err) => {
         if (cancelled) return;
         setState({ data: null, error: err.message ?? 'unknown' });
+      });
+
+    fetchJson('/stats/judge')
+      .then((res) => {
+        if (cancelled) return;
+        setJudgeStats(res);
+      })
+      .catch(() => {
+        // Soft fail — judge stats card just won't render.
       });
 
     return () => {
@@ -40,7 +50,7 @@ export default function Leaderboard() {
     <div className="max-w-content mx-auto px-6 py-12 md:py-16">
       <PageHeader />
 
-      {stats && <SummaryStats stats={stats} />}
+      {stats && <SummaryStats stats={stats} judgeStats={judgeStats} />}
       {!stats && !state.error && <SummaryStatsSkeleton />}
 
       <section className="mt-10">
@@ -117,18 +127,31 @@ function PageHeader() {
 // Summary stats
 // ============================================================================
 
-function SummaryStats({ stats }) {
+function SummaryStats({ stats, judgeStats }) {
+  const judgePercent =
+    judgeStats && judgeStats.totalVotes > 0
+      ? Math.round((judgeStats.agreedVotes / judgeStats.totalVotes) * 100)
+      : null;
+
+  const judgeValue = judgePercent === null ? '—' : `${judgePercent}%`;
+
+  const judgeSubline =
+    judgeStats && judgeStats.totalVotes > 0
+      ? `${judgeStats.agreedVotes}/${judgeStats.totalVotes} agreed`
+      : 'No votes yet';
+
   return (
-    <div className="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4">
+    <div className="grid grid-cols-2 md:grid-cols-5 gap-3 md:gap-4">
       <StatCard label="Debates run"   value={stats.totalDebates.toLocaleString()} />
       <StatCard label="Agents"        value={stats.totalAgents.toLocaleString()} />
       <StatCard label="Highest ELO"   value={stats.highestElo.toLocaleString()} accent />
       <StatCard label="Average ELO"   value={stats.avgElo.toLocaleString()} />
+      <StatCard label="Judge agreement" value={judgeValue} subline={judgeSubline} />
     </div>
   );
 }
 
-function StatCard({ label, value, accent }) {
+function StatCard({ label, value, accent, subline }) {
   return (
     <div className="card p-4 md:p-5">
       <p className="font-mono text-xs text-text-muted uppercase tracking-wider mb-2">
@@ -141,14 +164,19 @@ function StatCard({ label, value, accent }) {
       >
         {value}
       </p>
+      {subline && (
+        <p className="font-mono text-[10px] text-text-muted mt-2 truncate">
+          {subline}
+        </p>
+      )}
     </div>
   );
 }
 
 function SummaryStatsSkeleton() {
   return (
-    <div className="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4">
-      {Array.from({ length: 4 }).map((_, i) => (
+    <div className="grid grid-cols-2 md:grid-cols-5 gap-3 md:gap-4">
+      {Array.from({ length: 5 }).map((_, i) => (
         <div key={i} className="card p-5 h-[88px] animate-pulse" />
       ))}
     </div>

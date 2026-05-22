@@ -94,7 +94,7 @@ export default function Agent() {
   return (
     <div className="max-w-content mx-auto px-6 py-12 md:py-16">
       <ProfileHeader agent={data.agent} />
-      <StatsRow agent={data.agent} />
+      <StatsRow agent={data.agent} humanVoteStats={data.humanVoteStats ?? null} />
       <EloChart eloHistory={data.eloHistory ?? []} />
       <RecentDebatesSection
         recentDebates={data.recentDebates ?? []}
@@ -126,21 +126,34 @@ function ProfileHeader({ agent }) {
 // Stats row
 // ============================================================================
 
-function StatsRow({ agent }) {
+function StatsRow({ agent, humanVoteStats }) {
   const total = (agent.wins ?? 0) + (agent.losses ?? 0) + (agent.draws ?? 0);
   const winRate = total > 0 ? Math.round(((agent.wins ?? 0) / total) * 100) : null;
 
+  const humanVoted = humanVoteStats?.totalVotes ?? 0;
+  const overridden = humanVoteStats?.judgeOverridden ?? 0;
+
+  const humanVotedValue =
+    total === 0 || humanVoted === 0 ? '—' : `${humanVoted} of ${total}`;
+  const humanVotedSubline =
+    humanVoted === 0
+      ? null
+      : overridden === 0
+      ? 'all confirmed'
+      : `${overridden} overridden`;
+
   return (
-    <div className="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4 mb-12">
+    <div className="grid grid-cols-2 md:grid-cols-5 gap-3 md:gap-4 mb-12">
       <StatCard label="ELO"     value={Math.round(agent.elo ?? STARTING_ELO).toLocaleString()} accent />
       <StatCard label="Record"  value={total > 0 ? `${agent.wins}-${agent.losses}-${agent.draws}` : '—'} />
       <StatCard label="Win rate" value={winRate === null ? '—' : `${winRate}%`} />
       <StatCard label="Debates" value={total.toLocaleString()} />
+      <StatCard label="Human-voted" value={humanVotedValue} subline={humanVotedSubline} />
     </div>
   );
 }
 
-function StatCard({ label, value, accent }) {
+function StatCard({ label, value, accent, subline }) {
   return (
     <div className="card p-4 md:p-5">
       <p className="font-mono text-xs text-text-muted uppercase tracking-wider mb-2">
@@ -153,6 +166,11 @@ function StatCard({ label, value, accent }) {
       >
         {value}
       </p>
+      {subline && (
+        <p className="font-mono text-[10px] text-text-muted mt-2 truncate">
+          {subline}
+        </p>
+      )}
     </div>
   );
 }
@@ -384,8 +402,8 @@ function LoadingState() {
         <div className="h-12 bg-bg-surface rounded w-2/3 mb-3 animate-pulse" />
         <div className="h-4 bg-bg-surface rounded w-48 animate-pulse" />
       </div>
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4 mb-12">
-        {Array.from({ length: 4 }).map((_, i) => (
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-3 md:gap-4 mb-12">
+        {Array.from({ length: 5 }).map((_, i) => (
           <div key={i} className="card p-5 h-[88px] animate-pulse" />
         ))}
       </div>

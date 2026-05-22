@@ -28,6 +28,7 @@ import { fileURLToPath } from 'node:url';
 
 import agentsRouter from './routes/agents.js';
 import debatesRouter from './routes/debates.js';
+import statsRouter from './routes/stats.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -71,6 +72,7 @@ app.get('/api/health', (req, res) => {
 // API routers
 app.use('/api/agents', agentsRouter);
 app.use('/api/debates', debatesRouter);
+app.use('/api/stats', statsRouter);
 
 // Catch-all 404 for unmatched /api routes. Must come before the SPA fallback
 // so that an unknown /api/* path returns JSON instead of the React index.html.
