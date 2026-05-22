@@ -39,3 +39,8 @@ coverage/
 # Misc
 *.tsbuildinfo
 .cache/
+
+# Playwright (MCP browser snapshots, console logs, screenshots)
+.playwright-mcp/
+playwright-report/
+test-results/

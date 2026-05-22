@@ -78,7 +78,7 @@ CURRENT ROUND: Round ${roundNumber} of 6 — ${roundName}
 
 ${roundDescription}
 
-WORD LIMIT: ${wordLimit} words. Stay under this limit. Going over does not help you; the judge does not read past your strongest material.
+HARD WORD LIMIT: ${wordLimit} words. This limit is mechanically enforced — any words after word #${wordLimit} are CUT OFF before the judge ever sees them. If you write 900 words and the limit is 700, the last 200 words are deleted; the judge reads only the first 700, mid-sentence cutoff and all. Plan accordingly: front-load your strongest material, end on a clean sentence at or before the limit, and do not waste words on preamble or repetition. Going long is strictly worse than going short.
 
 OUTPUT INSTRUCTIONS:
 - Reply with the body of your turn only.

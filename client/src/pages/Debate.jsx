@@ -169,14 +169,22 @@ function reducer(state, action) {
         tokensOut,
         durationMs,
         resumed,
+        truncated,
+        originalWordCount,
+        wordLimit,
       } = action.payload;
       const legTurns = { ...state.turns[leg] };
       const existing =
         legTurns[round] ?? { round, side, segments: [], toolCalls: [], complete: false };
-      const segments =
-        existing.segments.length > 0
-          ? existing.segments
-          : [{ kind: 'text', text: content ?? '' }];
+      // When the backend truncated the agent's output, the streamed text in
+      // `segments` shows what the agent wrote; the saved `content` shows what
+      // the judge will read. Prefer the canonical (truncated) content so the
+      // visible turn matches what was actually scored.
+      const segments = truncated
+        ? [{ kind: 'text', text: content ?? '' }]
+        : existing.segments.length > 0
+        ? existing.segments
+        : [{ kind: 'text', text: content ?? '' }];
       legTurns[round] = {
         ...existing,
         side,
@@ -188,6 +196,9 @@ function reducer(state, action) {
         durationMs: durationMs ?? 0,
         complete: true,
         resumed: !!resumed,
+        truncated: !!truncated,
+        originalWordCount: originalWordCount ?? null,
+        wordLimit: wordLimit ?? null,
       };
       return {
         ...state,
@@ -582,11 +593,16 @@ function LegSection({ leg, state, dispatch, debateId }) {
   const isFirstLeg = leg === 1;
 
   return (
-    <section
-      className={
-        isFirstLeg ? 'mt-10' : 'mt-12 pt-12 border-t border-bg-border'
-      }
-    >
+    <section className={isFirstLeg ? 'mt-10' : 'mt-20'}>
+      {!isFirstLeg && (
+        <div className="relative my-12 flex items-center" aria-hidden="true">
+          <div className="flex-1 border-t-2 border-accent/40" />
+          <span className="px-4 font-mono text-xs uppercase tracking-[0.25em] text-accent">
+            Leg 2 begins · agents swap sides
+          </span>
+          <div className="flex-1 border-t-2 border-accent/40" />
+        </div>
+      )}
       <LegHeader
         leg={leg}
         reveal={state.reveal}
@@ -708,6 +724,15 @@ function RoundCard({ leg, def, turn, isActive }) {
       </div>
 
       <RoundBody turn={turn} isActive={isActive} sideTokens={sideTokens} />
+
+      {turn?.truncated && (
+        <p
+          className="mt-4 font-mono text-xs text-amber-400/90 border-t border-amber-500/20 pt-3"
+          title="The agent wrote past the word limit. Everything after the limit was cut before the judge read this turn."
+        >
+          Cut at {turn.wordLimit ?? '?'}-word limit (agent wrote {turn.originalWordCount ?? '?'}).
+        </p>
+      )}
     </article>
   );
 }

@@ -15,6 +15,7 @@ import { getAgentRunner } from '../agents/index.js';
 import { buildDebaterSystemPrompt } from '../agents/systemPrompts.js';
 import { ROUNDS, ROUND_DESCRIPTIONS } from './rounds.js';
 import { buildConversation } from './buildConversation.js';
+import { truncateToWordLimit } from './truncateToWordLimit.js';
 
 const ERROR_MESSAGE_MAX_LENGTH = 1000;
 
@@ -188,9 +189,19 @@ async function runLeg({
       throw new Error(`Agent did not yield turn_complete for leg ${leg} round ${round.number}`);
     }
 
-    const content = (turnComplete.content || '').trim();
-    if (!content) {
+    const rawContent = (turnComplete.content || '').trim();
+    if (!rawContent) {
       throw new Error(`Leg ${leg} Round ${round.number} produced empty content`);
+    }
+
+    const { content, originalWordCount, truncated } = truncateToWordLimit(
+      rawContent,
+      round.wordLimit,
+    );
+    if (truncated) {
+      console.log(
+        `[orchestrator] Leg ${leg} Round ${round.number} truncated: ${originalWordCount} → ${round.wordLimit} words`,
+      );
     }
 
     await prisma.debateTurn.create({
@@ -225,6 +236,9 @@ async function runLeg({
       tokensIn: turnComplete.tokensIn ?? 0,
       tokensOut: turnComplete.tokensOut ?? 0,
       durationMs: turnComplete.durationMs ?? 0,
+      truncated,
+      originalWordCount,
+      wordLimit: round.wordLimit,
     });
   }
 
